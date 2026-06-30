@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use spotwatt_core::Tariff;
 
 /// Runtime configuration, loaded from a TOML file (path in `SPOTWATT_CONFIG`,
 /// default `config.toml`) with a couple of env-var overrides for convenience.
@@ -22,6 +23,20 @@ pub struct Config {
     /// How often to re-fetch the price curve.
     #[serde(default = "d_refresh")]
     pub price_refresh_minutes: u64,
+    /// Site power budget in watts. When set, the scheduler won't start jobs
+    /// whose combined draw would exceed it — peak-shaving for the capacity
+    /// tariff. `None` disables the budget (count cap only).
+    #[serde(default)]
+    pub max_power_watts: Option<f64>,
+    /// Hard wall-clock cap on a single job run. A job still running after this
+    /// is killed and recorded as failed, so a hung command can't hold a
+    /// concurrency slot forever.
+    #[serde(default = "d_job_timeout")]
+    pub job_timeout_minutes: u64,
+    /// The price components beyond raw spot (grid, tax, VAT, strømstøtte) used
+    /// to compute the price the customer actually pays.
+    #[serde(default)]
+    pub tariff: Tariff,
 }
 
 fn d_region() -> String {
@@ -42,6 +57,9 @@ fn d_max_jobs() -> usize {
 fn d_refresh() -> u64 {
     30
 }
+fn d_job_timeout() -> u64 {
+    720
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -52,6 +70,9 @@ impl Default for Config {
             tick_seconds: d_tick(),
             max_concurrent_jobs: d_max_jobs(),
             price_refresh_minutes: d_refresh(),
+            max_power_watts: None,
+            job_timeout_minutes: d_job_timeout(),
+            tariff: Tariff::default(),
         }
     }
 }

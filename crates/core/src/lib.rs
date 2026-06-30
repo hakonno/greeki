@@ -9,7 +9,11 @@
 pub mod job;
 pub mod price;
 pub mod schedule;
+pub mod select;
+pub mod tariff;
 
 pub use job::{JobSpec, Policy, Priority};
 pub use price::{PricePoint, PriceSeries};
 pub use schedule::{cheapest_window, hour_floor, plan, slots_for, window_at, Plan, Window};
+pub use select::select_within_budget;
+pub use tariff::Tariff;

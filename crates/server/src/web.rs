@@ -9,7 +9,7 @@ use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::Deserialize;
 use spotwatt_core::{plan, Policy, PriceSeries, Priority};
 
-use crate::model::{Job, JobStatus, NewJob};
+use crate::model::{Job, JobStatus, NewJob, Repeat};
 use crate::{cost, db, executor, AppState};
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -32,6 +32,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn index(State(state): State<Arc<AppState>>) -> Markup {
     let prices = state.prices.read().await.clone();
+    let effective = prices.with_tariff(&state.config.tariff);
     let jobs = db::list_jobs(&state.db).await.unwrap_or_default();
     let now = Utc::now();
 
@@ -56,7 +57,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         section.card {
             h2 { "Jobs" }
             div #jobs hx-get="/fragment/jobs" hx-trigger="every 5s" hx-swap="innerHTML" {
-                (render_jobs(&jobs, &prices, now))
+                (render_jobs(&jobs, &effective, now))
             }
         }
 
@@ -72,9 +73,9 @@ async fn prices_fragment(State(state): State<Arc<AppState>>) -> Markup {
 }
 
 async fn jobs_fragment(State(state): State<Arc<AppState>>) -> Markup {
-    let prices = state.prices.read().await.clone();
+    let effective = state.prices.read().await.with_tariff(&state.config.tariff);
     let jobs = db::list_jobs(&state.db).await.unwrap_or_default();
-    render_jobs(&jobs, &prices, Utc::now())
+    render_jobs(&jobs, &effective, Utc::now())
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +88,7 @@ pub struct CreateForm {
     deadline: Option<String>,
     power_watts: Option<String>,
     priority: Option<String>,
+    repeat: Option<String>,
 }
 
 async fn create_job(
@@ -110,6 +112,10 @@ async fn create_job(
             "critical" => Priority::Critical,
             _ => Priority::Normal,
         };
+        let repeat = match form.repeat.as_deref().unwrap_or("none") {
+            "daily" => Repeat::Daily,
+            _ => Repeat::None,
+        };
         let new = NewJob {
             name,
             command,
@@ -118,6 +124,7 @@ async fn create_job(
             deadline: form.deadline.as_deref().and_then(parse_deadline),
             power_watts: parse_f64(&form.power_watts),
             priority,
+            repeat,
             created_at: Utc::now(),
         };
         if let Err(e) = db::create_job(&state.db, new).await {
@@ -125,9 +132,9 @@ async fn create_job(
         }
     }
 
-    let prices = state.prices.read().await.clone();
+    let effective = state.prices.read().await.with_tariff(&state.config.tariff);
     let jobs = db::list_jobs(&state.db).await.unwrap_or_default();
-    render_jobs(&jobs, &prices, Utc::now())
+    render_jobs(&jobs, &effective, Utc::now())
 }
 
 async fn cancel(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Markup {
@@ -268,6 +275,9 @@ fn render_job(job: &Job, prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
                 @if job.priority != Priority::Normal {
                     span.prio { (priority_label(job.priority)) }
                 }
+                @if job.repeat == Repeat::Daily {
+                    span.prio { "↻ daily" }
+                }
             }
             div.cmd { code { (job.command) } }
 
@@ -345,6 +355,12 @@ fn add_form() -> Markup {
                         option value="low" { "Low" }
                         option value="high" { "High" }
                         option value="critical" { "Critical" }
+                    }
+                }
+                label { "Repeat"
+                    select name="repeat" {
+                        option value="none" { "Once" }
+                        option value="daily" { "Daily (rolls deadline +24h)" }
                     }
                 }
             }

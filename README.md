@@ -92,6 +92,29 @@ You pick one of three ways for a job to wait:
 Priority (low/normal/high/critical) breaks ties when the concurrency cap forces
 a choice; deadlines break ties after that.
 
+Any policy can also **repeat daily** — on completion the job re-queues itself for
+the next day with its deadline rolled forward 24h, so "nightly backup before
+07:00" is genuinely nightly rather than single-shot.
+
+## Pricing what you actually pay
+
+Bare Nord Pool spot is *not* the number on a Norwegian bill, so scheduling
+against it optimizes the wrong thing. spotwatt plans and costs against the
+**effective consumer price**: `spot + grid energy + electricity tax`, all under
+VAT, minus the **strømstøtte** refund (which flattens the expensive end of the
+curve). Because that refund compresses peaks, it changes which hours are really
+cheapest — and keeps `est_cost` honest. Tune the components in `[tariff]`
+(`config.example.toml`); set them to zero / `subsidy_rate = 0` to optimize bare
+spot instead.
+
+## Peak-shaving (capacity tariff)
+
+The Norwegian grid bill has a capacity component (kapasitetsledd) keyed to your
+*peak hourly draw*, so the real lever is limiting simultaneous load, not just job
+count. Set `max_power_watts` and the scheduler refuses to start jobs whose
+combined draw would exceed the budget — a smaller job can still slot into
+leftover headroom, and an oversized job runs alone rather than starving forever.
+
 ## Why these choices
 
 - **Rust** — the server runs 24/7, so you want something that uses little
@@ -150,5 +173,12 @@ cargo test -p spotwatt-core      # the scheduling algorithm
 
 ## Status
 
-MVP. Single-shot jobs (recurring schedules are a planned next step). The command
-runs via `sh -c`; run only commands you trust.
+MVP, now with daily-recurring jobs, an effective-price (post-tariff) cost model,
+a site power budget for peak-shaving, per-job timeouts, and startup
+reconciliation of jobs orphaned by a crash. See [`docs/CRITIQUE.md`](docs/CRITIQUE.md)
+for an honest review of where this is and isn't worth it, and what's next.
+
+The command runs via `sh -c` and the dashboard has **no authentication** — run
+it only on a trusted network, and only with commands you trust. Adding auth (and
+an actuator layer for real high-draw devices like EV chargers and water heaters)
+is the next priority.

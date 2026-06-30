@@ -1,0 +1,21 @@
+# spotwatt configuration — copy to config.toml and adjust.
+# All fields are optional; the values below are the defaults.
+
+# Spot-price region: NO1 (Oslo/Øst), NO2 (Kristiansand/Sør),
+# NO3 (Trondheim/Midt), NO4 (Tromsø/Nord), NO5 (Bergen/Vest).
+region = "NO1"
+
+# Address the dashboard listens on. Use 0.0.0.0:8080 to expose on the LAN.
+listen = "127.0.0.1:8080"
+
+# sqlx connection string. mode=rwc creates the file if missing.
+database_url = "sqlite:spotwatt.db?mode=rwc"
+
+# How often the scheduler re-evaluates every pending job (seconds, min 5).
+tick_seconds = 60
+
+# Maximum jobs allowed to run simultaneously.
+max_concurrent_jobs = 2
+
+# How often to re-fetch the price curve from hvakosterstrommen.no (minutes).
+price_refresh_minutes = 30

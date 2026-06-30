@@ -1,0 +1,10 @@
+[package]
+name = "spotwatt-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Pure scheduling logic for power-price-aware compute scheduling"
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }

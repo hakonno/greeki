@@ -1,0 +1,26 @@
+[package]
+name = "spotwatt-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Power-price-aware compute scheduler daemon (HTTP + scheduler + executor)"
+
+[[bin]]
+name = "spotwatt"
+path = "src/main.rs"
+
+[dependencies]
+spotwatt-core = { path = "../core" }
+strompris = "0.4"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+maud = { version = "0.26", features = ["axum"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"

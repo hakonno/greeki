@@ -19,3 +19,22 @@ max_concurrent_jobs = 2
 
 # How often to re-fetch the price curve from hvakosterstrommen.no (minutes).
 price_refresh_minutes = 30
+
+# Site power budget in watts. When set, the scheduler will not start jobs whose
+# combined draw would exceed it — peak-shaving for the capacity tariff
+# (kapasitetsledd). Leave unset (commented out) to cap by job count only.
+# max_power_watts = 5000
+
+# Hard wall-clock cap on a single job run, in minutes. A job still running after
+# this is killed and recorded as failed, so a hung command can't hold a slot.
+job_timeout_minutes = 720
+
+# Effective-price model. spotwatt schedules and prices against what the customer
+# actually pays, not bare spot: spot + grid energy + electricity tax, all under
+# VAT, minus the strømstøtte refund. Adjust to your own tariff sheet.
+[tariff]
+grid_energy_nok_per_kwh = 0.40       # nettleie energy component, ex-VAT
+electricity_tax_nok_per_kwh = 0.1644 # elavgift, ex-VAT
+vat_rate = 0.25                      # 0.0 for the VAT-exempt northern counties
+subsidy_threshold_nok_per_kwh = 0.9375 # strømstøtte kicks in above this (ex-VAT)
+subsidy_rate = 0.90                  # fraction of spot above the threshold refunded

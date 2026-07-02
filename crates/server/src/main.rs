@@ -30,6 +30,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(region = %config.region, "starting spotwatt");
 
     let db = db::init(&config.database_url).await?;
+
+    // Any job left "running" is an orphan from a previous process that died
+    // mid-run; clear it so its concurrency slot is freed and state is honest.
+    match db::reconcile_orphans(&db, chrono::Utc::now().timestamp()).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!("reconciled {n} orphaned running job(s) from a previous run"),
+        Err(e) => tracing::warn!("orphan reconciliation failed: {e:?}"),
+    }
+
     let state = Arc::new(AppState {
         db,
         prices: RwLock::new(PriceSeries::default()),

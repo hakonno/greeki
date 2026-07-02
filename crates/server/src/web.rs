@@ -10,7 +10,7 @@ use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::Deserialize;
 use spotwatt_core::{interval_cost, plan, JobSpec, Policy, PriceSeries, Priority};
 
-use crate::model::{Job, JobStatus, NewJob};
+use crate::model::{Job, JobStatus, NewJob, Repeat};
 use crate::{db, executor, AppState};
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -33,7 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 // ---------------------------------------------------------------------------
 
 async fn index(State(state): State<Arc<AppState>>) -> Markup {
-    let prices = state.prices.read().await.clone();
+    let effective = state.prices.read().await.with_tariff(&state.config.tariff);
     let (jobs, learned) = jobs_with_learning(&state).await;
     let now = Utc::now();
 
@@ -44,9 +44,9 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         }
 
         section.card {
-            h2 { "Spot price" }
+            h2 { "Power price (effective)" }
             div #prices hx-get="/fragment/prices" hx-trigger="every 30s" hx-swap="innerHTML" {
-                (render_prices(&prices, now))
+                (render_prices(&effective, now))
             }
         }
 
@@ -58,7 +58,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         section.card {
             h2 { "Jobs" }
             div #jobs hx-get="/fragment/jobs" hx-trigger="every 5s" hx-swap="innerHTML" {
-                (render_jobs(&jobs, &learned, &prices, now))
+                (render_jobs(&jobs, &learned, &effective, now))
             }
         }
 
@@ -69,14 +69,14 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
 }
 
 async fn prices_fragment(State(state): State<Arc<AppState>>) -> Markup {
-    let prices = state.prices.read().await.clone();
-    render_prices(&prices, Utc::now())
+    let effective = state.prices.read().await.with_tariff(&state.config.tariff);
+    render_prices(&effective, Utc::now())
 }
 
 async fn jobs_fragment(State(state): State<Arc<AppState>>) -> Markup {
-    let prices = state.prices.read().await.clone();
+    let effective = state.prices.read().await.with_tariff(&state.config.tariff);
     let (jobs, learned) = jobs_with_learning(&state).await;
-    render_jobs(&jobs, &learned, &prices, Utc::now())
+    render_jobs(&jobs, &learned, &effective, Utc::now())
 }
 
 /// Load all jobs together with each job's learned runtime (when it has enough
@@ -102,6 +102,7 @@ pub struct CreateForm {
     deadline: Option<String>,
     power_watts: Option<String>,
     priority: Option<String>,
+    repeat: Option<String>,
 }
 
 async fn create_job(
@@ -125,6 +126,10 @@ async fn create_job(
             "critical" => Priority::Critical,
             _ => Priority::Normal,
         };
+        let repeat = match form.repeat.as_deref().unwrap_or("none") {
+            "daily" => Repeat::Daily,
+            _ => Repeat::None,
+        };
         let new = NewJob {
             name,
             command,
@@ -133,6 +138,7 @@ async fn create_job(
             deadline: form.deadline.as_deref().and_then(parse_deadline),
             power_watts: parse_f64(&form.power_watts),
             priority,
+            repeat,
             created_at: Utc::now(),
         };
         if let Err(e) = db::create_job(&state.db, new).await {
@@ -140,9 +146,9 @@ async fn create_job(
         }
     }
 
-    let prices = state.prices.read().await.clone();
+    let effective = state.prices.read().await.with_tariff(&state.config.tariff);
     let (jobs, learned) = jobs_with_learning(&state).await;
-    render_jobs(&jobs, &learned, &prices, Utc::now())
+    render_jobs(&jobs, &learned, &effective, Utc::now())
 }
 
 async fn cancel(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Markup {
@@ -267,7 +273,7 @@ fn render_prices(prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
                 }
             }
         }
-        p.muted { "Known horizon: " (prices.len()) " hours. 🟡Yellow = current hour. 🟢Green = cheapest, ." }
+        p.muted { "Known horizon: " (prices.len()) " hours. 🟡 Yellow = current hour. 🟢 Green = cheapest. Effective price: spot + nettleie + elavgift + MVA − strømstøtte." }
     }
 }
 
@@ -335,6 +341,9 @@ fn render_job(
                 span.policy { (policy_label(&job.policy)) }
                 @if job.priority != Priority::Normal {
                     span.prio { (priority_label(job.priority)) }
+                }
+                @if job.repeat == Repeat::Daily {
+                    span.prio { "↻ daily" }
                 }
             }
             div.cmd { code { (job.command) } }
@@ -428,7 +437,10 @@ fn add_form() -> Markup {
                     input #duration-input type="number" name="duration_minutes" value="60" min="1";
                     small.hint { "First guess; refined from real run times after a few runs." }
                 }
-                label { "Threshold (kr/kWh)" input type="number" step="0.01" name="threshold_nok" placeholder="0.50"; }
+                label { "Threshold (kr/kWh)"
+                    input type="number" step="0.01" name="threshold_nok" placeholder="1.20";
+                    small.hint { "Compared against the effective price in the chart, not raw spot." }
+                }
                 label { "Finish by (optional)"
                     input type="datetime-local" name="deadline";
                     small.hint { "Job must be DONE by this time — it's started early enough to finish, not started at this time." }
@@ -440,6 +452,12 @@ fn add_form() -> Markup {
                         option value="low" { "Low" }
                         option value="high" { "High" }
                         option value="critical" { "Critical" }
+                    }
+                }
+                label { "Repeat"
+                    select name="repeat" {
+                        option value="none" { "Once" }
+                        option value="daily" { "Daily (rolls deadline +24h)" }
                     }
                 }
             }

@@ -4,7 +4,7 @@ use spotwatt_core::{Policy, Priority};
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
-use crate::model::{Job, JobStatus, NewJob};
+use crate::model::{Job, JobStatus, NewJob, Repeat};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS jobs (
@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     deadline         INTEGER,
     power_watts      REAL,
     priority         TEXT    NOT NULL DEFAULT 'normal',
+    repeat_kind      TEXT    NOT NULL DEFAULT 'none',
     status           TEXT    NOT NULL DEFAULT 'pending',
     scheduled_start  INTEGER,
     created_at       INTEGER NOT NULL,
@@ -34,7 +35,40 @@ pub async fn init(url: &str) -> Result<SqlitePool> {
         .connect(url)
         .await?;
     sqlx::query(SCHEMA).execute(&pool).await?;
+    // Add columns introduced after the original schema. Ignore the "duplicate
+    // column" error on databases that already have them.
+    let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN repeat_kind TEXT NOT NULL DEFAULT 'none'")
+        .execute(&pool)
+        .await;
     Ok(pool)
+}
+
+/// On startup, any job still marked `running` is an orphan from a previous
+/// process that died mid-run: nothing is executing it, yet it occupies a
+/// concurrency slot forever. Mark such jobs failed so slots free up and the
+/// state is honest. Returns how many were reconciled.
+pub async fn reconcile_orphans(pool: &SqlitePool, now: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE jobs
+         SET status = 'failed', finished_at = ?,
+             output = COALESCE(output, '') || '\n[interrupted: server restarted while running]'
+         WHERE status = 'running'",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Total nameplate power (watts) of all currently running jobs. Jobs with no
+/// declared power contribute nothing. Used to enforce the site power budget.
+pub async fn running_power_watts(pool: &SqlitePool) -> Result<f64> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(power_watts), 0.0) AS w FROM jobs WHERE status = 'running'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<f64, _>("w"))
 }
 
 fn from_ts(secs: Option<i64>) -> Option<DateTime<Utc>> {
@@ -78,6 +112,7 @@ fn row_to_job(row: &SqliteRow) -> Job {
     };
 
     let status: String = row.get("status");
+    let repeat: String = row.get("repeat_kind");
 
     Job {
         id: row.get("id"),
@@ -88,6 +123,7 @@ fn row_to_job(row: &SqliteRow) -> Job {
         deadline: from_ts(row.get("deadline")),
         power_watts: row.get("power_watts"),
         priority,
+        repeat: Repeat::from_db(&repeat),
         status: JobStatus::from_db(&status),
         scheduled_start: from_ts(row.get("scheduled_start")),
         created_at: from_ts(Some(row.get::<i64, _>("created_at"))).unwrap_or_else(Utc::now),
@@ -104,8 +140,8 @@ pub async fn create_job(pool: &SqlitePool, n: NewJob) -> Result<Job> {
     let res = sqlx::query(
         "INSERT INTO jobs
             (name, command, policy_kind, threshold_nok, duration_minutes, deadline,
-             power_watts, priority, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+             power_watts, priority, repeat_kind, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
     )
     .bind(&n.name)
     .bind(&n.command)
@@ -115,6 +151,7 @@ pub async fn create_job(pool: &SqlitePool, n: NewJob) -> Result<Job> {
     .bind(n.deadline.map(|d| d.timestamp()))
     .bind(n.power_watts)
     .bind(priority_to_db(n.priority))
+    .bind(n.repeat.as_str())
     .bind(n.created_at.timestamp())
     .execute(pool)
     .await?;
@@ -123,6 +160,29 @@ pub async fn create_job(pool: &SqlitePool, n: NewJob) -> Result<Job> {
     get_job(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("inserted job {id} vanished"))
+}
+
+/// Schedule the next occurrence of a recurring job, given the one that just
+/// finished. Daily jobs reappear as a fresh pending row with any deadline
+/// rolled forward 24h. Non-recurring jobs do nothing. Returns the new job, if
+/// one was created.
+pub async fn create_next_occurrence(pool: &SqlitePool, finished: &Job) -> Result<Option<Job>> {
+    let step = match finished.repeat {
+        Repeat::None => return Ok(None),
+        Repeat::Daily => chrono::Duration::days(1),
+    };
+    let next = NewJob {
+        name: finished.name.clone(),
+        command: finished.command.clone(),
+        policy: finished.policy,
+        duration_minutes: finished.duration_minutes,
+        deadline: finished.deadline.map(|d| d + step),
+        power_watts: finished.power_watts,
+        priority: finished.priority,
+        repeat: finished.repeat,
+        created_at: Utc::now(),
+    };
+    create_job(pool, next).await.map(Some)
 }
 
 pub async fn list_jobs(pool: &SqlitePool) -> Result<Vec<Job>> {

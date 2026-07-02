@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
-use spotwatt_core::{plan, JobSpec};
+use spotwatt_core::{plan, select_within_budget, JobSpec};
 
 use crate::model::Job;
 use crate::{db, executor, AppState};
@@ -25,8 +25,21 @@ pub async fn run(state: Arc<AppState>) {
 }
 
 async fn tick(state: &Arc<AppState>) -> Result<()> {
-    let prices = state.prices.read().await.clone();
+    // Plan and cost against the effective consumer price (spot + grid + tax +
+    // VAT − strømstøtte), not raw spot — that's the number the bill is in.
+    let prices = state
+        .prices
+        .read()
+        .await
+        .with_tariff(&state.config.tariff);
     let now = Utc::now();
+
+    // If the curve doesn't cover the current hour the data is stale or missing;
+    // price-driven policies will correctly decline to start (only Immediate and
+    // genuinely deadline-forced jobs run), but it's worth flagging.
+    if !prices.is_empty() && prices.price_at(now).is_none() {
+        tracing::warn!("price curve does not cover the current hour — prices may be stale");
+    }
 
     let pending = db::pending_jobs(&state.db).await?;
     let mut runnable: Vec<Job> = Vec::new();
@@ -68,19 +81,29 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
             })
     });
 
+    // Two constraints: the job-count cap, and (if set) a site power budget that
+    // keeps simultaneous draw down to shave the capacity tariff.
     let running = db::running_count(&state.db).await?;
-    let mut free = (state.config.max_concurrent_jobs as i64 - running).max(0);
+    let free_slots = (state.config.max_concurrent_jobs as i64 - running).max(0) as usize;
+    let committed_watts = db::running_power_watts(&state.db).await?;
+    let candidate_watts: Vec<f64> = runnable
+        .iter()
+        .map(|j| j.power_watts.unwrap_or(0.0).max(0.0))
+        .collect();
+    let chosen = select_within_budget(
+        &candidate_watts,
+        free_slots,
+        committed_watts,
+        state.config.max_power_watts,
+    );
 
-    for job in runnable {
-        if free <= 0 {
-            break;
-        }
+    for idx in chosen {
+        let job = runnable[idx].clone();
         // Claim the job atomically so a slow executor start can't cause a
         // second tick to launch the same job twice.
         let started = Utc::now();
         match db::claim_for_running(&state.db, job.id, started.timestamp()).await {
             Ok(true) => {
-                free -= 1;
                 let st = state.clone();
                 tracing::info!("launching job {} ({})", job.id, job.name);
                 tokio::spawn(async move { executor::run_job(st, job, started).await });

@@ -11,9 +11,13 @@ pub mod job;
 pub mod learn;
 pub mod price;
 pub mod schedule;
+pub mod select;
+pub mod tariff;
 
 pub use cost::interval_cost;
 pub use job::{JobSpec, Policy, Priority};
 pub use learn::estimate_minutes;
 pub use price::{PricePoint, PriceSeries};
 pub use schedule::{cheapest_window, hour_floor, plan, slots_for, window_at, Plan, Window};
+pub use select::select_within_budget;
+pub use tariff::Tariff;

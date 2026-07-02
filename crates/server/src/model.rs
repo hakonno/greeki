@@ -35,6 +35,33 @@ impl JobStatus {
     }
 }
 
+/// How (and whether) a job re-creates itself after it finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Repeat {
+    /// Single-shot: runs once and is done.
+    None,
+    /// On completion, schedule the same job again for the next day (any deadline
+    /// rolls forward 24h). Makes "nightly backup before 07:00" actually nightly.
+    Daily,
+}
+
+impl Repeat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Repeat::None => "none",
+            Repeat::Daily => "daily",
+        }
+    }
+
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "daily" => Repeat::Daily,
+            _ => Repeat::None,
+        }
+    }
+}
+
 /// A full job record as persisted and shown in the dashboard.
 #[derive(Debug, Clone, Serialize)]
 pub struct Job {
@@ -46,6 +73,7 @@ pub struct Job {
     pub deadline: Option<DateTime<Utc>>,
     pub power_watts: Option<f64>,
     pub priority: Priority,
+    pub repeat: Repeat,
     pub status: JobStatus,
     pub scheduled_start: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -73,5 +101,6 @@ pub struct NewJob {
     pub deadline: Option<DateTime<Utc>>,
     pub power_watts: Option<f64>,
     pub priority: Priority,
+    pub repeat: Repeat,
     pub created_at: DateTime<Utc>,
 }

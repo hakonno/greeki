@@ -18,42 +18,52 @@ pub async fn run_job(state: Arc<AppState>, job: Job, started: DateTime<Utc>) {
     let timeout = Duration::from_secs(state.config.job_timeout_minutes.max(1) * 60);
 
     // `kill_on_drop` means that if we abandon the wait future on timeout, the
-    // child is killed rather than leaked.
-    let child = Command::new("sh")
-        .arg("-c")
+    // shell is killed rather than leaked. That alone is not enough: `sh -c`
+    // often spawns children of its own (pipelines, `&&` chains), and killing
+    // only the shell would leave them running past the timeout. Putting the
+    // shell in its own process group lets the timeout kill the whole tree.
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(&job.command)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
 
-    let (status, exit_code, mut output) = match child {
+    let (status, exit_code, mut output) = match cmd.spawn() {
         Err(e) => (JobStatus::Failed, None, format!("failed to start command: {e}")),
-        Ok(child) => match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(out)) => {
-                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if !stderr.trim().is_empty() {
-                    text.push_str("\n[stderr]\n");
-                    text.push_str(&stderr);
+        Ok(child) => {
+            let pgid = child.id();
+            match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                Ok(Ok(out)) => {
+                    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stderr.trim().is_empty() {
+                        text.push_str("\n[stderr]\n");
+                        text.push_str(&stderr);
+                    }
+                    let status = if out.status.success() {
+                        JobStatus::Completed
+                    } else {
+                        JobStatus::Failed
+                    };
+                    (status, out.status.code().map(|c| c as i64), text)
                 }
-                let status = if out.status.success() {
-                    JobStatus::Completed
-                } else {
-                    JobStatus::Failed
-                };
-                (status, out.status.code().map(|c| c as i64), text)
+                Ok(Err(e)) => (JobStatus::Failed, None, format!("command error: {e}")),
+                Err(_elapsed) => {
+                    kill_group(pgid);
+                    (
+                        JobStatus::Failed,
+                        None,
+                        format!(
+                            "killed: exceeded the {} min timeout",
+                            state.config.job_timeout_minutes
+                        ),
+                    )
+                }
             }
-            Ok(Err(e)) => (JobStatus::Failed, None, format!("command error: {e}")),
-            Err(_elapsed) => (
-                JobStatus::Failed,
-                None,
-                format!(
-                    "killed: exceeded the {} min timeout",
-                    state.config.job_timeout_minutes
-                ),
-            ),
-        },
+        }
     };
 
     let finished = Utc::now();
@@ -97,6 +107,19 @@ pub async fn run_job(state: Arc<AppState>, job: Job, started: DateTime<Utc>) {
         exit_code
     );
 }
+
+/// Kill a timed-out job's whole process group. The shell was spawned as its
+/// own group leader, so its pid doubles as the pgid and a negative pid signals
+/// every process in the tree — including children the shell forked.
+#[cfg(unix)]
+fn kill_group(pgid: Option<u32>) {
+    if let Some(pgid) = pgid {
+        unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pgid: Option<u32>) {}
 
 /// Truncate a string to at most `max` bytes without splitting a UTF-8 char.
 fn clip(s: &mut String, max: usize) {

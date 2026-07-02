@@ -13,11 +13,16 @@ pub mod price;
 pub mod schedule;
 pub mod select;
 pub mod tariff;
+pub mod window;
+
+#[cfg(test)]
+mod testutil;
 
 pub use cost::interval_cost;
 pub use job::{JobSpec, Policy, Priority};
 pub use learn::estimate_minutes;
 pub use price::{PricePoint, PriceSeries};
-pub use schedule::{cheapest_window, hour_floor, plan, slots_for, window_at, Plan, Window};
+pub use schedule::{plan, Plan};
 pub use select::select_within_budget;
 pub use tariff::{EnergyModel, Tariff};
+pub use window::{cheapest_window, hour_floor, slots_for, window_at, Window};

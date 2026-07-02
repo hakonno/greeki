@@ -55,6 +55,7 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
             policy: job.policy,
             duration_minutes: duration,
             deadline: job.deadline,
+            earliest_start: job.earliest_start,
         };
         let decision = plan(&spec, &prices, now);
         db::set_scheduled_start(&state.db, job.id, decision.start_at.map(|d| d.timestamp()))

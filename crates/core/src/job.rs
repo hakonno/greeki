@@ -41,4 +41,8 @@ pub struct JobSpec {
     pub policy: Policy,
     pub duration_minutes: i64,
     pub deadline: Option<DateTime<Utc>>,
+    /// Do not start before this instant, regardless of policy or price.
+    /// Recurring jobs set it on the next occurrence so a "daily" job can't
+    /// fire again the same day it just ran.
+    pub earliest_start: Option<DateTime<Utc>>,
 }

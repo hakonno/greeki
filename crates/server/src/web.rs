@@ -139,6 +139,7 @@ async fn create_job(
             power_watts: parse_f64(&form.power_watts),
             priority,
             repeat,
+            earliest_start: None,
             created_at: Utc::now(),
         };
         if let Err(e) = db::create_job(&state.db, new).await {
@@ -308,6 +309,7 @@ fn render_job(
         policy: job.policy,
         duration_minutes: eff_minutes,
         deadline: job.deadline,
+        earliest_start: job.earliest_start,
     };
     let dur = Duration::minutes(eff_minutes.max(0));
 
@@ -360,6 +362,9 @@ fn render_job(
                     }
                 }
                 @if let Some(w) = job.power_watts { span { "⚡ " (format!("{:.0}", w)) " W" } }
+                @if let Some(e) = job.earliest_start {
+                    @if e > now { span { "⏳ not before " (fmt_oslo(e)) } }
+                }
                 @if let Some(dl) = job.deadline { span { "⛳ finish by " (fmt_oslo(dl)) } }
                 @if job.status == JobStatus::Running {
                     @if let Some(f) = finish { span { "≈ done " (fmt_oslo(f)) } }

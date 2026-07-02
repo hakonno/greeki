@@ -74,6 +74,9 @@ pub struct Job {
     pub power_watts: Option<f64>,
     pub priority: Priority,
     pub repeat: Repeat,
+    /// Earliest instant the job may start; recurring jobs use it to hold the
+    /// next occurrence back until its own day.
+    pub earliest_start: Option<DateTime<Utc>>,
     pub status: JobStatus,
     pub scheduled_start: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -102,5 +105,6 @@ pub struct NewJob {
     pub power_watts: Option<f64>,
     pub priority: Priority,
     pub repeat: Repeat,
+    pub earliest_start: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }

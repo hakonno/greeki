@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     power_watts      REAL,
     priority         TEXT    NOT NULL DEFAULT 'normal',
     repeat_kind      TEXT    NOT NULL DEFAULT 'none',
+    earliest_start   INTEGER,
     status           TEXT    NOT NULL DEFAULT 'pending',
     scheduled_start  INTEGER,
     created_at       INTEGER NOT NULL,
@@ -38,6 +39,9 @@ pub async fn init(url: &str) -> Result<SqlitePool> {
     // Add columns introduced after the original schema. Ignore the "duplicate
     // column" error on databases that already have them.
     let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN repeat_kind TEXT NOT NULL DEFAULT 'none'")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN earliest_start INTEGER")
         .execute(&pool)
         .await;
     Ok(pool)
@@ -124,6 +128,7 @@ fn row_to_job(row: &SqliteRow) -> Job {
         power_watts: row.get("power_watts"),
         priority,
         repeat: Repeat::from_db(&repeat),
+        earliest_start: from_ts(row.get("earliest_start")),
         status: JobStatus::from_db(&status),
         scheduled_start: from_ts(row.get("scheduled_start")),
         created_at: from_ts(Some(row.get::<i64, _>("created_at"))).unwrap_or_else(Utc::now),
@@ -140,8 +145,8 @@ pub async fn create_job(pool: &SqlitePool, n: NewJob) -> Result<Job> {
     let res = sqlx::query(
         "INSERT INTO jobs
             (name, command, policy_kind, threshold_nok, duration_minutes, deadline,
-             power_watts, priority, repeat_kind, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+             power_watts, priority, repeat_kind, earliest_start, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
     )
     .bind(&n.name)
     .bind(&n.command)
@@ -152,6 +157,7 @@ pub async fn create_job(pool: &SqlitePool, n: NewJob) -> Result<Job> {
     .bind(n.power_watts)
     .bind(priority_to_db(n.priority))
     .bind(n.repeat.as_str())
+    .bind(n.earliest_start.map(|d| d.timestamp()))
     .bind(n.created_at.timestamp())
     .execute(pool)
     .await?;
@@ -163,24 +169,55 @@ pub async fn create_job(pool: &SqlitePool, n: NewJob) -> Result<Job> {
 }
 
 /// Schedule the next occurrence of a recurring job, given the one that just
-/// finished. Daily jobs reappear as a fresh pending row with any deadline
-/// rolled forward 24h. Non-recurring jobs do nothing. Returns the new job, if
-/// one was created.
+/// finished. Non-recurring jobs do nothing. Returns the new job, if one was
+/// created.
+///
+/// The next occurrence always gets an `earliest_start`: without it the fresh
+/// pending row is immediately eligible, and a "daily" threshold job would
+/// re-run on every cheap tick all day. With a deadline the next cycle is
+/// [deadline, deadline + 24h] — it may start the moment the previous cycle
+/// ends. Without one, the job may run again 24h after this run's anchor.
 pub async fn create_next_occurrence(pool: &SqlitePool, finished: &Job) -> Result<Option<Job>> {
     let step = match finished.repeat {
         Repeat::None => return Ok(None),
         Repeat::Daily => chrono::Duration::days(1),
+    };
+    let now = Utc::now();
+    let (deadline, earliest_start) = match finished.deadline {
+        Some(dl) => {
+            // Roll forward to the next *future* deadline. Several may have
+            // been missed if the server was down; catching up on each of them
+            // would fire a burst of stale runs.
+            let mut next_dl = dl + step;
+            while next_dl <= now {
+                next_dl = next_dl + step;
+            }
+            (Some(next_dl), Some(next_dl - step))
+        }
+        None => {
+            // Keep a stable daily cadence by chaining from the previous
+            // earliest_start; re-anchor on the actual start time if that is
+            // later (e.g. after downtime), so we never queue a burst.
+            let anchor = match (finished.earliest_start, finished.started_at) {
+                (Some(e), Some(s)) => e.max(s),
+                (Some(e), None) => e,
+                (None, Some(s)) => s,
+                (None, None) => now,
+            };
+            (None, Some(anchor + step))
+        }
     };
     let next = NewJob {
         name: finished.name.clone(),
         command: finished.command.clone(),
         policy: finished.policy,
         duration_minutes: finished.duration_minutes,
-        deadline: finished.deadline.map(|d| d + step),
+        deadline,
         power_watts: finished.power_watts,
         priority: finished.priority,
         repeat: finished.repeat,
-        created_at: Utc::now(),
+        earliest_start,
+        created_at: now,
     };
     create_job(pool, next).await.map(Some)
 }

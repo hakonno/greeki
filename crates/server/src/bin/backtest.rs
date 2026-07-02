@@ -191,6 +191,7 @@ fn realistic_start(
         policy: Policy::CheapestWindow,
         duration_minutes: job.duration_minutes,
         deadline: Some(deadline),
+        earliest_start: None,
     };
     let mut t = release;
     while t <= deadline {

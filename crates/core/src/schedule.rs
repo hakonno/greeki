@@ -142,6 +142,13 @@ pub fn window_at(prices: &PriceSeries, from: DateTime<Utc>, k: usize) -> Option<
 pub fn plan(spec: &JobSpec, prices: &PriceSeries, now: DateTime<Utc>) -> Plan {
     let duration = Duration::minutes(spec.duration_minutes.max(0));
     match spec.policy {
+        Policy::Immediate if before_earliest(spec, now) => Plan {
+            run_now: false,
+            start_at: spec.earliest_start,
+            forced: false,
+            window_avg_nok: None,
+            reason: "waiting for its earliest-start time".to_string(),
+        },
         Policy::Immediate => Plan {
             run_now: true,
             start_at: Some(now),
@@ -162,6 +169,13 @@ fn deadline_forces(deadline: Option<DateTime<Utc>>, now: DateTime<Utc>, duration
     matches!(deadline, Some(dl) if dl - now <= duration)
 }
 
+/// True while `spec.earliest_start` still forbids starting. Nothing — not even
+/// a deadline — overrides it; a deadline earlier than the earliest start is a
+/// contradiction and the earliest start wins.
+fn before_earliest(spec: &JobSpec, now: DateTime<Utc>) -> bool {
+    matches!(spec.earliest_start, Some(e) if now < e)
+}
+
 fn plan_threshold(
     spec: &JobSpec,
     prices: &PriceSeries,
@@ -169,7 +183,8 @@ fn plan_threshold(
     max: f64,
     duration: Duration,
 ) -> Plan {
-    if deadline_forces(spec.deadline, now, duration) {
+    let gated = before_earliest(spec, now);
+    if deadline_forces(spec.deadline, now, duration) && !gated {
         return Plan {
             run_now: true,
             start_at: Some(now),
@@ -180,7 +195,7 @@ fn plan_threshold(
     }
 
     match prices.price_at(now) {
-        Some(p) if p.nok_per_kwh <= max => Plan {
+        Some(p) if p.nok_per_kwh <= max && !gated => Plan {
             run_now: true,
             start_at: Some(now),
             forced: false,
@@ -188,21 +203,34 @@ fn plan_threshold(
             reason: format!("price {:.3} kr ≤ threshold {:.3} kr", p.nok_per_kwh, max),
         },
         Some(p) => {
+            let not_before = spec.earliest_start.unwrap_or(now);
+            // First hour that is not over, not entirely before the allowed
+            // start, and satisfies the threshold and deadline. The projected
+            // start clamps into that hour if the gate opens mid-hour.
             let next = prices
                 .points
                 .iter()
                 .find(|q| {
-                    q.start > now
+                    q.end > now
+                        && q.end > not_before
                         && q.nok_per_kwh <= max
                         && spec.deadline.map_or(true, |dl| q.end <= dl)
                 })
-                .map(|q| q.start);
+                .map(|q| q.start.max(not_before).max(now));
+            let reason = if gated && p.nok_per_kwh <= max {
+                format!(
+                    "price {:.3} kr is fine – waiting for its earliest-start time",
+                    p.nok_per_kwh
+                )
+            } else {
+                format!("price {:.3} kr > threshold {:.3} kr – waiting", p.nok_per_kwh, max)
+            };
             Plan {
                 run_now: false,
                 start_at: next,
                 forced: false,
                 window_avg_nok: Some(p.nok_per_kwh),
-                reason: format!("price {:.3} kr > threshold {:.3} kr – waiting", p.nok_per_kwh, max),
+                reason,
             }
         }
         None => Plan {
@@ -222,8 +250,14 @@ fn plan_cheapest(
     duration: Duration,
 ) -> Plan {
     let k = slots_for(spec.duration_minutes);
-    let earliest = hour_floor(now);
-    let forced = deadline_forces(spec.deadline, now, duration);
+    // Windows may not start before the current hour, nor before an explicit
+    // earliest start. The earliest start is deliberately *not* floored: a
+    // window whose hour begins before it would allow a too-early launch.
+    let earliest = match spec.earliest_start {
+        Some(e) if e > hour_floor(now) => e,
+        _ => hour_floor(now),
+    };
+    let forced = deadline_forces(spec.deadline, now, duration) && !before_earliest(spec, now);
 
     match cheapest_window(prices, earliest, spec.deadline, k) {
         Some(w) => {
@@ -310,6 +344,7 @@ mod tests {
             policy,
             duration_minutes: minutes,
             deadline,
+            earliest_start: None,
         }
     }
 
@@ -390,5 +425,77 @@ mod tests {
         let s = series(base(), &[0.1, 0.1]);
         let p = plan(&spec(Policy::CheapestWindow, 180, None), &s, base());
         assert!(!p.run_now);
+    }
+
+    // -- earliest_start: a recurring job's next occurrence must not fire the
+    //    same day it was created, no matter how cheap the prices are. --
+
+    #[test]
+    fn earliest_start_holds_back_cheapest_window() {
+        // Cheapest hour is right now, but the job may not start until hour 2.
+        let s = series(base(), &[0.1, 0.5, 0.2, 0.9]);
+        let mut job = spec(Policy::CheapestWindow, 60, None);
+        job.earliest_start = Some(base() + Duration::hours(2));
+
+        let p = plan(&job, &s, base());
+        assert!(!p.run_now);
+        assert_eq!(p.start_at, Some(base() + Duration::hours(2)));
+
+        let p2 = plan(&job, &s, base() + Duration::hours(2));
+        assert!(p2.run_now);
+    }
+
+    #[test]
+    fn earliest_start_holds_back_threshold() {
+        // Price is below the threshold the whole time; only the gate decides.
+        let s = series(base(), &[0.1, 0.1, 0.1]);
+        let mut job = spec(Policy::Threshold { max_nok_per_kwh: 0.5 }, 60, None);
+        job.earliest_start = Some(base() + Duration::hours(1));
+
+        let p0 = plan(&job, &s, base());
+        assert!(!p0.run_now);
+        assert_eq!(p0.start_at, Some(base() + Duration::hours(1)));
+
+        let p1 = plan(&job, &s, base() + Duration::hours(1));
+        assert!(p1.run_now);
+    }
+
+    #[test]
+    fn earliest_start_holds_back_immediate() {
+        let s = series(base(), &[0.1]);
+        let mut job = spec(Policy::Immediate, 60, None);
+        job.earliest_start = Some(base() + Duration::hours(2));
+
+        assert!(!plan(&job, &s, base()).run_now);
+        assert!(plan(&job, &s, base() + Duration::hours(2)).run_now);
+    }
+
+    #[test]
+    fn deadline_does_not_force_past_earliest_start() {
+        // Deadline math says "must start now to finish", but the earliest
+        // start forbids it — the gate wins over the (contradictory) deadline.
+        let s = series(base(), &[0.5, 0.5]);
+        let mut job = spec(
+            Policy::CheapestWindow,
+            120,
+            Some(base() + Duration::minutes(90)),
+        );
+        job.earliest_start = Some(base() + Duration::hours(1));
+
+        let p = plan(&job, &s, base());
+        assert!(!p.run_now);
+    }
+
+    #[test]
+    fn mid_hour_earliest_start_delays_to_next_full_hour_window() {
+        // Earliest start 00:30: the 00:00 window would begin before it, so the
+        // first eligible cheapest-window start is 01:00.
+        let s = series(base(), &[0.1, 0.2, 0.9]);
+        let mut job = spec(Policy::CheapestWindow, 60, None);
+        job.earliest_start = Some(base() + Duration::minutes(30));
+
+        let p = plan(&job, &s, base() + Duration::minutes(45));
+        assert!(!p.run_now);
+        assert_eq!(p.start_at, Some(base() + Duration::hours(1)));
     }
 }

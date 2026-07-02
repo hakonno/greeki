@@ -34,7 +34,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn index(State(state): State<Arc<AppState>>) -> Markup {
     let effective = state.prices.read().await.with_tariff(&state.config.tariff);
-    let (jobs, learned) = jobs_with_learning(&state).await;
+    let (jobs, learned, savings) = jobs_with_learning(&state).await;
     let now = Utc::now();
 
     layout(html! {
@@ -58,7 +58,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         section.card {
             h2 { "Jobs" }
             div #jobs hx-get="/fragment/jobs" hx-trigger="every 5s" hx-swap="innerHTML" {
-                (render_jobs(&jobs, &learned, &effective, now))
+                (render_jobs(&jobs, &learned, savings, &effective, now))
             }
         }
 
@@ -75,13 +75,15 @@ async fn prices_fragment(State(state): State<Arc<AppState>>) -> Markup {
 
 async fn jobs_fragment(State(state): State<Arc<AppState>>) -> Markup {
     let effective = state.prices.read().await.with_tariff(&state.config.tariff);
-    let (jobs, learned) = jobs_with_learning(&state).await;
-    render_jobs(&jobs, &learned, &effective, Utc::now())
+    let (jobs, learned, savings) = jobs_with_learning(&state).await;
+    render_jobs(&jobs, &learned, savings, &effective, Utc::now())
 }
 
 /// Load all jobs together with each job's learned runtime (when it has enough
-/// history), keyed by job id.
-async fn jobs_with_learning(state: &AppState) -> (Vec<Job>, HashMap<i64, (i64, usize)>) {
+/// history, keyed by job id) and the all-time savings rollup.
+async fn jobs_with_learning(
+    state: &AppState,
+) -> (Vec<Job>, HashMap<i64, (i64, usize)>, Option<(f64, i64)>) {
     let jobs = db::list_jobs(&state.db).await.unwrap_or_default();
     let mut learned = HashMap::new();
     for job in &jobs {
@@ -89,7 +91,8 @@ async fn jobs_with_learning(state: &AppState) -> (Vec<Job>, HashMap<i64, (i64, u
             learned.insert(job.id, info);
         }
     }
-    (jobs, learned)
+    let savings = db::savings_rollup(&state.db).await.ok();
+    (jobs, learned, savings)
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,8 +151,8 @@ async fn create_job(
     }
 
     let effective = state.prices.read().await.with_tariff(&state.config.tariff);
-    let (jobs, learned) = jobs_with_learning(&state).await;
-    render_jobs(&jobs, &learned, &effective, Utc::now())
+    let (jobs, learned, savings) = jobs_with_learning(&state).await;
+    render_jobs(&jobs, &learned, savings, &effective, Utc::now())
 }
 
 async fn cancel(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Markup {
@@ -281,6 +284,7 @@ fn render_prices(prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
 fn render_jobs(
     jobs: &[Job],
     learned: &HashMap<i64, (i64, usize)>,
+    savings: Option<(f64, i64)>,
     prices: &PriceSeries,
     now: DateTime<Utc>,
 ) -> Markup {
@@ -288,6 +292,15 @@ fn render_jobs(
         return html! { p.muted { "No jobs yet. Add one above." } };
     }
     html! {
+        @if let Some((saved, n)) = savings {
+            @if n > 0 {
+                p.rollup {
+                    "💰 est. " (fmt_kr(saved)) " saved vs starting each job on submit, over "
+                    (n) " priced run" @if n != 1 { "s" }
+                    " — measured against the effective tariff, not raw spot"
+                }
+            }
+        }
         div.jobs {
             @for job in jobs {
                 (render_job(job, learned.get(&job.id).copied(), prices, now))
@@ -400,6 +413,9 @@ fn render_job(
                     @if let Some(secs) = elapsed_secs(job) { span { "took " (elapsed_label(secs)) } }
                     @if let Some(s) = job.started_at { span { "ran " (fmt_oslo(s)) } }
                     @if let Some(cost) = job.est_cost_nok { span { "cost " (fmt_kr(cost)) } }
+                    @if let (Some(c), Some(b)) = (job.est_cost_nok, job.baseline_cost_nok) {
+                        @if b - c > 0.005 { span.good { "saved ~" (fmt_kr(b - c)) " vs submit" } }
+                    }
                 }
                 @if let Some(out) = &job.output {
                     @if !out.trim().is_empty() {
@@ -638,7 +654,8 @@ padding:3px 8px;font-size:13px;display:inline-block;color:#cdd6e3}
 .plan .when{color:var(--blue)}
 .plan .warn{color:var(--accent);font-weight:600}
 .savings{display:flex;gap:14px;font-size:13px;margin-top:4px}
-.savings .good{color:var(--good)}
+.savings .good,.result .good{color:var(--good)}
+.rollup{font-size:13px;color:var(--good);margin:0 0 10px}
 .result{display:flex;gap:16px;color:var(--muted);font-size:13px;margin-top:6px}
 details{margin-top:8px} summary{cursor:pointer;color:var(--muted);font-size:13px}
 pre{background:#0b0d12;border:1px solid var(--line);border-radius:6px;

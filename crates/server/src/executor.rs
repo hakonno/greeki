@@ -69,12 +69,25 @@ pub async fn run_job(state: Arc<AppState>, job: Job, started: DateTime<Utc>) {
     let finished = Utc::now();
     clip(&mut output, MAX_OUTPUT_BYTES);
 
-    // Estimate what the run actually cost, using the *effective* consumer price
-    // (spot + grid + tax + VAT − strømstøtte) over the real start/end window.
-    let est_cost = {
+    // Estimate what the run actually cost — and what the same run would have
+    // cost had it started the moment the job was submitted — both against the
+    // *effective* consumer price. The baseline is what the savings report is
+    // measured against; it is None (and the run doesn't count toward savings)
+    // when the price curve no longer covers the submit time.
+    let (est_cost, baseline_cost) = {
         let prices = state.prices.read().await.with_tariff(&state.config.tariff);
-        job.power_kw()
-            .and_then(|kw| interval_cost(&prices, started, finished, kw))
+        match job.power_kw() {
+            Some(kw) => (
+                interval_cost(&prices, started, finished, kw),
+                interval_cost(
+                    &prices,
+                    job.created_at,
+                    job.created_at + (finished - started),
+                    kw,
+                ),
+            ),
+            None => (None, None),
+        }
     };
 
     if let Err(e) = db::mark_finished(
@@ -85,6 +98,7 @@ pub async fn run_job(state: Arc<AppState>, job: Job, started: DateTime<Utc>) {
         exit_code,
         &output,
         est_cost,
+        baseline_cost,
     )
     .await
     {

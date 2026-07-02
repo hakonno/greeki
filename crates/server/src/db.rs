@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at      INTEGER,
     exit_code        INTEGER,
     output           TEXT,
-    est_cost_nok     REAL
+    est_cost_nok     REAL,
+    baseline_cost_nok REAL
 );
 "#;
 
@@ -42,6 +43,9 @@ pub async fn init(url: &str) -> Result<SqlitePool> {
         .execute(&pool)
         .await;
     let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN earliest_start INTEGER")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN baseline_cost_nok REAL")
         .execute(&pool)
         .await;
     Ok(pool)
@@ -137,6 +141,7 @@ fn row_to_job(row: &SqliteRow) -> Job {
         exit_code: row.get("exit_code"),
         output: row.get("output"),
         est_cost_nok: row.get("est_cost_nok"),
+        baseline_cost_nok: row.get("baseline_cost_nok"),
     }
 }
 
@@ -281,10 +286,12 @@ pub async fn mark_finished(
     exit_code: Option<i64>,
     output: &str,
     est_cost: Option<f64>,
+    baseline_cost: Option<f64>,
 ) -> Result<()> {
     sqlx::query(
         "UPDATE jobs
-         SET status = ?, finished_at = ?, exit_code = ?, output = ?, est_cost_nok = ?
+         SET status = ?, finished_at = ?, exit_code = ?, output = ?, est_cost_nok = ?,
+             baseline_cost_nok = ?
          WHERE id = ?",
     )
     .bind(status.as_str())
@@ -292,10 +299,27 @@ pub async fn mark_finished(
     .bind(exit_code)
     .bind(output)
     .bind(est_cost)
+    .bind(baseline_cost)
     .bind(id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Total estimated kroner saved across completed jobs versus starting each one
+/// the moment it was submitted, and how many runs that covers. Only runs where
+/// both cost estimates exist count — the number is honest, not aspirational.
+pub async fn savings_rollup(pool: &SqlitePool) -> Result<(f64, i64)> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(baseline_cost_nok - est_cost_nok), 0.0) AS saved,
+                COUNT(*) AS n
+         FROM jobs
+         WHERE status = 'completed'
+           AND baseline_cost_nok IS NOT NULL AND est_cost_nok IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok((row.get("saved"), row.get("n")))
 }
 
 pub async fn cancel_job(pool: &SqlitePool, id: i64) -> Result<()> {

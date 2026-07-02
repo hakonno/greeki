@@ -85,6 +85,9 @@ pub struct Job {
     pub exit_code: Option<i64>,
     pub output: Option<String>,
     pub est_cost_nok: Option<f64>,
+    /// What the run would have cost had it started the moment it was
+    /// submitted — the honest baseline the savings claim is measured against.
+    pub baseline_cost_nok: Option<f64>,
 }
 
 impl Job {

@@ -7,4 +7,5 @@ description = "Pure scheduling logic for power-price-aware compute scheduling"
 
 [dependencies]
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 serde = { workspace = true }

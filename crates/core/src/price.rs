@@ -39,8 +39,9 @@ impl PriceSeries {
     /// A copy of this series with every hour's `nok_per_kwh` replaced by the
     /// effective consumer price under `tariff`. This is the series scheduling
     /// and cost estimation should run against — it is what the customer actually
-    /// pays, and (because strømstøtte flattens the top of the curve) it ranks
-    /// hours differently from raw spot. The raw `eur_per_kwh` is left untouched.
+    /// pays, and (because strømstøtte flattens the top of the curve and the
+    /// grid rate steps between day and night) it ranks hours differently from
+    /// raw spot. The raw `eur_per_kwh` is left untouched.
     pub fn with_tariff(&self, tariff: &Tariff) -> PriceSeries {
         let points = self
             .points
@@ -48,7 +49,7 @@ impl PriceSeries {
             .map(|p| PricePoint {
                 start: p.start,
                 end: p.end,
-                nok_per_kwh: tariff.effective(p.nok_per_kwh),
+                nok_per_kwh: tariff.effective_at(p.nok_per_kwh, p.start),
                 eur_per_kwh: p.eur_per_kwh,
             })
             .collect();

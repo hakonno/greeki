@@ -30,10 +30,17 @@ price_refresh_minutes = 30
 job_timeout_minutes = 720
 
 # Effective-price model. spotwatt schedules and prices against what the customer
-# actually pays, not bare spot: spot + grid energy + electricity tax, all under
-# VAT, minus the strømstøtte refund. Adjust to your own tariff sheet.
+# actually pays, not bare spot: energy + grid energy + electricity tax, all under
+# VAT. Adjust to your own tariff sheet and deal.
 [tariff]
-grid_energy_nok_per_kwh = 0.40       # nettleie energy component, ex-VAT
+# How the energy itself is priced:
+#   "spot"       — hourly spot minus the strømstøtte refund (default)
+#   "norgespris" — the fixed state price; spot is irrelevant, and the only
+#                  hourly variation left is the grid day/night step
+energy_model = "spot"
+norgespris_nok_per_kwh = 0.40        # Norgespris energy price, ex-VAT (0.50 incl)
+grid_energy_day_nok_per_kwh = 0.40   # nettleie energy component, weekdays 06–22, ex-VAT
+grid_energy_night_nok_per_kwh = 0.32 # nettleie at night (22–06) and weekends, ex-VAT
 electricity_tax_nok_per_kwh = 0.1644 # elavgift, ex-VAT
 vat_rate = 0.25                      # 0.0 for the VAT-exempt northern counties
 subsidy_threshold_nok_per_kwh = 0.9375 # strømstøtte kicks in above this (ex-VAT)

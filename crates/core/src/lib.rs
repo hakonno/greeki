@@ -20,4 +20,4 @@ pub use learn::estimate_minutes;
 pub use price::{PricePoint, PriceSeries};
 pub use schedule::{cheapest_window, hour_floor, plan, slots_for, window_at, Plan, Window};
 pub use select::select_within_budget;
-pub use tariff::Tariff;
+pub use tariff::{EnergyModel, Tariff};

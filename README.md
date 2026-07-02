@@ -100,12 +100,21 @@ the next day with its deadline rolled forward 24h, so "nightly backup before
 
 Bare Nord Pool spot is *not* the number on a Norwegian bill, so scheduling
 against it optimizes the wrong thing. spotwatt plans and costs against the
-**effective consumer price**: `spot + grid energy + electricity tax`, all under
-VAT, minus the **strømstøtte** refund (which flattens the expensive end of the
-curve). Because that refund compresses peaks, it changes which hours are really
-cheapest — and keeps `est_cost` honest. Tune the components in `[tariff]`
-(`config.example.toml`); set them to zero / `subsidy_rate = 0` to optimize bare
-spot instead.
+**effective consumer price**: `energy + grid energy + electricity tax`, all
+under VAT. The energy part depends on your deal:
+
+- **spot + strømstøtte** (default): the refund flattens the expensive end of
+  the curve, which changes which hours are really cheapest;
+- **Norgespris** (`energy_model = "norgespris"`): the fixed state price makes
+  the spot curve irrelevant — the only per-hour signal left is the grid rent's
+  cheaper night/weekend rate, and spotwatt schedules on exactly that.
+
+The grid energy rate itself is time-differentiated (day vs night/weekend), as
+with most Norwegian grid operators. Tune everything in `[tariff]`
+(`config.example.toml`); zero it out / `subsidy_rate = 0` to optimize bare spot
+instead. The dashboard also keeps an honest running total of estimated kroner
+saved versus starting every job the moment it was submitted — measured against
+the effective tariff, so it won't flatter itself.
 
 ## Peak-shaving (capacity tariff)
 

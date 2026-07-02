@@ -216,3 +216,32 @@ pub async fn delete_job(pool: &SqlitePool, id: i64) -> Result<()> {
         .await?;
     Ok(())
 }
+
+/// Recent measured runtimes (minutes) of successful runs of the exact same
+/// command, most recent first. This is the raw history the runtime learner
+/// turns into a planning estimate.
+pub async fn measured_durations(pool: &SqlitePool, command: &str, limit: i64) -> Result<Vec<i64>> {
+    let rows = sqlx::query(
+        "SELECT (finished_at - started_at) AS secs FROM jobs
+         WHERE command = ? AND status = 'completed'
+           AND started_at IS NOT NULL AND finished_at IS NOT NULL
+           AND finished_at >= started_at
+         ORDER BY finished_at DESC LIMIT ?",
+    )
+    .bind(command)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<i64, _>("secs") as f64 / 60.0).round() as i64)
+        .collect())
+}
+
+/// Learned planning duration for a command, plus how many runs it's based on.
+/// `None` until there's enough history to trust.
+pub async fn learned_duration(pool: &SqlitePool, command: &str) -> Option<(i64, usize)> {
+    let samples = measured_durations(pool, command, 10).await.ok()?;
+    let n = samples.len();
+    spotwatt_core::estimate_minutes(&samples, 3).map(|est| (est, n))
+}

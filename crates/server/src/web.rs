@@ -1,16 +1,17 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Europe::Oslo;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::Deserialize;
-use spotwatt_core::{plan, Policy, PriceSeries, Priority};
+use spotwatt_core::{interval_cost, plan, JobSpec, Policy, PriceSeries, Priority};
 
 use crate::model::{Job, JobStatus, NewJob};
-use crate::{cost, db, executor, AppState};
+use crate::{db, executor, AppState};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -21,6 +22,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/jobs/:id/delete", post(delete))
         .route("/fragment/jobs", get(jobs_fragment))
         .route("/fragment/prices", get(prices_fragment))
+        .route("/fragment/cmd-hint", get(cmd_hint))
         .route("/api/prices", get(api_prices))
         .route("/api/jobs", get(api_jobs))
         .with_state(state)
@@ -32,7 +34,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn index(State(state): State<Arc<AppState>>) -> Markup {
     let prices = state.prices.read().await.clone();
-    let jobs = db::list_jobs(&state.db).await.unwrap_or_default();
+    let (jobs, learned) = jobs_with_learning(&state).await;
     let now = Utc::now();
 
     layout(html! {
@@ -56,7 +58,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         section.card {
             h2 { "Jobs" }
             div #jobs hx-get="/fragment/jobs" hx-trigger="every 5s" hx-swap="innerHTML" {
-                (render_jobs(&jobs, &prices, now))
+                (render_jobs(&jobs, &learned, &prices, now))
             }
         }
 
@@ -73,8 +75,21 @@ async fn prices_fragment(State(state): State<Arc<AppState>>) -> Markup {
 
 async fn jobs_fragment(State(state): State<Arc<AppState>>) -> Markup {
     let prices = state.prices.read().await.clone();
+    let (jobs, learned) = jobs_with_learning(&state).await;
+    render_jobs(&jobs, &learned, &prices, Utc::now())
+}
+
+/// Load all jobs together with each job's learned runtime (when it has enough
+/// history), keyed by job id.
+async fn jobs_with_learning(state: &AppState) -> (Vec<Job>, HashMap<i64, (i64, usize)>) {
     let jobs = db::list_jobs(&state.db).await.unwrap_or_default();
-    render_jobs(&jobs, &prices, Utc::now())
+    let mut learned = HashMap::new();
+    for job in &jobs {
+        if let Some(info) = db::learned_duration(&state.db, &job.command).await {
+            learned.insert(job.id, info);
+        }
+    }
+    (jobs, learned)
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,8 +141,8 @@ async fn create_job(
     }
 
     let prices = state.prices.read().await.clone();
-    let jobs = db::list_jobs(&state.db).await.unwrap_or_default();
-    render_jobs(&jobs, &prices, Utc::now())
+    let (jobs, learned) = jobs_with_learning(&state).await;
+    render_jobs(&jobs, &learned, &prices, Utc::now())
 }
 
 async fn cancel(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Markup {
@@ -159,6 +174,33 @@ async fn api_prices(State(state): State<Arc<AppState>>) -> Json<PriceSeries> {
 
 async fn api_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<Job>> {
     Json(db::list_jobs(&state.db).await.unwrap_or_default())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CmdQuery {
+    command: Option<String>,
+}
+
+/// Live hint for the "add job" form: if the typed command has enough run
+/// history, show what we measured and prefill the duration field (out-of-band).
+async fn cmd_hint(State(state): State<Arc<AppState>>, Query(q): Query<CmdQuery>) -> Markup {
+    let command = q.command.unwrap_or_default();
+    let command = command.trim();
+    if command.is_empty() {
+        return html! {};
+    }
+    match db::learned_duration(&state.db, command).await {
+        Some((est, n)) => html! {
+            span.recognized {
+                "✓ seen this command before — measured ~" (dur_label(est)) " over " (n)
+                " runs (filled in below; the scheduler uses this)"
+            }
+            // Out-of-band: replace the duration input with the learned value.
+            input #duration-input type="number" name="duration_minutes" min="1"
+                value=(est) hx-swap-oob="true";
+        },
+        None => html! {},
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,37 +267,63 @@ fn render_prices(prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
                 }
             }
         }
-        p.muted { "Known horizon: " (prices.len()) " hours · bars from the current hour. Green = cheapest, amber = now." }
+        p.muted { "Known horizon: " (prices.len()) " hours. 🟡Yellow = current hour. 🟢Green = cheapest, ." }
     }
 }
 
-fn render_jobs(jobs: &[Job], prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
+fn render_jobs(
+    jobs: &[Job],
+    learned: &HashMap<i64, (i64, usize)>,
+    prices: &PriceSeries,
+    now: DateTime<Utc>,
+) -> Markup {
     if jobs.is_empty() {
         return html! { p.muted { "No jobs yet. Add one above." } };
     }
     html! {
         div.jobs {
             @for job in jobs {
-                (render_job(job, prices, now))
+                (render_job(job, learned.get(&job.id).copied(), prices, now))
             }
         }
     }
 }
 
-fn render_job(job: &Job, prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
+fn render_job(
+    job: &Job,
+    learned: Option<(i64, usize)>,
+    prices: &PriceSeries,
+    now: DateTime<Utc>,
+) -> Markup {
+    // Plan with the measured runtime when we have enough history, otherwise the
+    // user's estimate.
+    let eff_minutes = learned.map(|(est, _)| est).unwrap_or(job.duration_minutes);
+    let spec = JobSpec {
+        policy: job.policy,
+        duration_minutes: eff_minutes,
+        deadline: job.deadline,
+    };
+    let dur = Duration::minutes(eff_minutes.max(0));
+
     let decision = if job.status == JobStatus::Pending {
-        Some(plan(&job.spec(), prices, now))
+        Some(plan(&spec, prices, now))
     } else {
         None
+    };
+
+    // Estimated finish time, using the effective duration.
+    let finish = match job.status {
+        JobStatus::Running => job.started_at.map(|s| s + dur),
+        JobStatus::Pending => decision.as_ref().and_then(|d| d.start_at).map(|s| s + dur),
+        _ => None,
     };
 
     // Projected savings vs. running right now (only for deferrable jobs we can price).
     let projected = decision.as_ref().and_then(|d| {
         let kw = job.power_kw()?;
         let start = d.start_at?;
-        let dur = Duration::minutes(job.duration_minutes.max(0));
-        let window = cost::interval_cost(prices, start, start + dur, kw)?;
-        let now_cost = cost::interval_cost(prices, now, now + dur, kw)?;
+        let window = interval_cost(prices, start, start + dur, kw)?;
+        let now_cost = interval_cost(prices, now, now + dur, kw)?;
         Some((now_cost - window, window))
     });
 
@@ -272,9 +340,21 @@ fn render_job(job: &Job, prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
             div.cmd { code { (job.command) } }
 
             div.meta {
-                span { "⏱ " (job.duration_minutes) " min" }
+                @if job.status == JobStatus::Pending || job.status == JobStatus::Running {
+                    span {
+                        "⏱ est. " (dur_label(job.duration_minutes))
+                        @if let Some((est, n)) = learned {
+                            @if est != job.duration_minutes {
+                                span.learned { " (measured ~" (dur_label(est)) " over " (n) " runs)" }
+                            }
+                        }
+                    }
+                }
                 @if let Some(w) = job.power_watts { span { "⚡ " (format!("{:.0}", w)) " W" } }
-                @if let Some(dl) = job.deadline { span { "⛳ by " (fmt_oslo(dl)) } }
+                @if let Some(dl) = job.deadline { span { "⛳ finish by " (fmt_oslo(dl)) } }
+                @if job.status == JobStatus::Running {
+                    @if let Some(f) = finish { span { "≈ done " (fmt_oslo(f)) } }
+                }
             }
 
             @if let Some(d) = &decision {
@@ -282,8 +362,11 @@ fn render_job(job: &Job, prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
                     span.reason { (d.reason) }
                     @if let Some(start) = d.start_at {
                         @if !d.run_now {
-                            span.when { "→ " (fmt_oslo(start)) }
+                            span.when { "→ starts " (fmt_oslo(start)) }
                         }
+                    }
+                    @if let Some(f) = finish {
+                        span.muted { "done by ~" (fmt_oslo(f)) }
                     }
                     @if d.forced { span.warn { "forced" } }
                 }
@@ -300,6 +383,7 @@ fn render_job(job: &Job, prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
             @if job.status == JobStatus::Completed || job.status == JobStatus::Failed {
                 div.result {
                     @if let Some(c) = job.exit_code { span { "exit " (c) } }
+                    @if let Some(secs) = elapsed_secs(job) { span { "took " (elapsed_label(secs)) } }
                     @if let Some(s) = job.started_at { span { "ran " (fmt_oslo(s)) } }
                     @if let Some(cost) = job.est_cost_nok { span { "cost " (fmt_kr(cost)) } }
                 }
@@ -325,9 +409,14 @@ fn render_job(job: &Job, prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
 fn add_form() -> Markup {
     html! {
         form hx-post="/jobs" hx-target="#jobs" hx-swap="innerHTML" {
+            label.wide { "Command"
+                textarea name="command" rows="2" placeholder="restic backup /data"
+                    hx-get="/fragment/cmd-hint" hx-trigger="change, keyup changed delay:500ms"
+                    hx-target="#cmd-hint" hx-swap="innerHTML" {}
+                small #cmd-hint .hint {}
+            }
             div.grid {
                 label { "Name" input type="text" name="name" placeholder="nightly backup" required; }
-                label { "Command" input type="text" name="command" placeholder="restic backup /data" required; }
                 label { "Policy"
                     select name="policy" {
                         option value="cheapest" { "Cheapest window" }
@@ -335,9 +424,15 @@ fn add_form() -> Markup {
                         option value="immediate" { "Immediate (critical)" }
                     }
                 }
-                label { "Duration (min)" input type="number" name="duration_minutes" value="60" min="1"; }
+                label { "Est. duration (min)"
+                    input #duration-input type="number" name="duration_minutes" value="60" min="1";
+                    small.hint { "First guess; refined from real run times after a few runs." }
+                }
                 label { "Threshold (kr/kWh)" input type="number" step="0.01" name="threshold_nok" placeholder="0.50"; }
-                label { "Deadline" input type="datetime-local" name="deadline"; }
+                label { "Finish by (optional)"
+                    input type="datetime-local" name="deadline";
+                    small.hint { "Job must be DONE by this time — it's started early enough to finish, not started at this time." }
+                }
                 label { "Power (W)" input type="number" step="1" name="power_watts" placeholder="150"; }
                 label { "Priority"
                     select name="priority" {
@@ -359,6 +454,45 @@ fn add_form() -> Markup {
 
 fn fmt_kr(v: f64) -> String {
     format!("{:.2} kr", v)
+}
+
+fn dur_label(minutes: i64) -> String {
+    if minutes >= 60 && minutes % 60 == 0 {
+        format!("{} h", minutes / 60)
+    } else if minutes > 60 {
+        format!("{} h {} min", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes} min")
+    }
+}
+
+/// Actual wall-clock seconds a finished job took, if both timestamps exist.
+fn elapsed_secs(job: &Job) -> Option<i64> {
+    match (job.started_at, job.finished_at) {
+        (Some(s), Some(f)) if f >= s => Some((f - s).num_seconds()),
+        _ => None,
+    }
+}
+
+/// Human-friendly elapsed time: seconds under a minute, then minutes, then hours.
+fn elapsed_label(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let (m, s) = (secs / 60, secs % 60);
+        if s == 0 {
+            format!("{m} min")
+        } else {
+            format!("{m} min {s}s")
+        }
+    } else {
+        let (h, m) = (secs / 3600, (secs % 3600) / 60);
+        if m == 0 {
+            format!("{h} h")
+        } else {
+            format!("{h} h {m} min")
+        }
+    }
 }
 
 fn fmt_oslo(dt: DateTime<Utc>) -> String {
@@ -449,8 +583,13 @@ padding:18px 20px;margin-bottom:20px}
 .muted{color:var(--muted);font-size:13px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:14px}
 label{display:flex;flex-direction:column;font-size:12px;color:var(--muted);gap:4px}
-input,select{background:var(--bg);border:1px solid var(--line);color:var(--fg);
+input,select,textarea{background:var(--bg);border:1px solid var(--line);color:var(--fg);
 border-radius:8px;padding:8px 10px;font-size:14px}
+textarea{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;min-height:42px;width:100%}
+.wide{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+.hint{display:block;font-size:11px;color:var(--muted);margin-top:3px;font-weight:400}
+.learned{color:var(--good)}
+.recognized{color:var(--good)}
 button{background:var(--blue);color:#fff;border:0;border-radius:8px;padding:8px 14px;
 font-size:13px;cursor:pointer}
 button:hover{filter:brightness(1.1)}

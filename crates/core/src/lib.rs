@@ -6,10 +6,14 @@
 //! in. That keeps the interesting decisions (which the rest of the system leans
 //! on) under unit tests.
 
+pub mod cost;
 pub mod job;
+pub mod learn;
 pub mod price;
 pub mod schedule;
 
+pub use cost::interval_cost;
 pub use job::{JobSpec, Policy, Priority};
+pub use learn::estimate_minutes;
 pub use price::{PricePoint, PriceSeries};
 pub use schedule::{cheapest_window, hour_floor, plan, slots_for, window_at, Plan, Window};

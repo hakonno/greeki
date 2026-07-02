@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use spotwatt_core::{JobSpec, Policy, Priority};
+use spotwatt_core::{Policy, Priority};
 
 /// Lifecycle state of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -57,15 +57,6 @@ pub struct Job {
 }
 
 impl Job {
-    /// The slice of this job the scheduling algorithm needs.
-    pub fn spec(&self) -> JobSpec {
-        JobSpec {
-            policy: self.policy,
-            duration_minutes: self.duration_minutes,
-            deadline: self.deadline,
-        }
-    }
-
     /// Estimated average power draw, in kW.
     pub fn power_kw(&self) -> Option<f64> {
         self.power_watts.map(|w| w / 1000.0)

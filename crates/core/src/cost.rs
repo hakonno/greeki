@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
-use spotwatt_core::PriceSeries;
+
+use crate::price::PriceSeries;
 
 /// Energy cost in NOK of drawing `power_kw` continuously over `[start, end)`,
 /// integrated across the hourly price curve (handles partial-hour overlaps).

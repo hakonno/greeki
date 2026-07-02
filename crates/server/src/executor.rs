@@ -4,8 +4,10 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
 
+use spotwatt_core::interval_cost;
+
 use crate::model::{Job, JobStatus};
-use crate::{cost, db, AppState};
+use crate::{db, AppState};
 
 const MAX_OUTPUT_BYTES: usize = 8_000;
 
@@ -47,7 +49,7 @@ pub async fn run_job(state: Arc<AppState>, job: Job, started: DateTime<Utc>) {
     let est_cost = {
         let prices = state.prices.read().await;
         job.power_kw()
-            .and_then(|kw| cost::interval_cost(&prices, started, finished, kw))
+            .and_then(|kw| interval_cost(&prices, started, finished, kw))
     };
 
     if let Err(e) = db::mark_finished(

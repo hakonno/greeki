@@ -3,3 +3,7 @@
 *.db-shm
 *.db-wal
 config.toml
+*.pdf
+LEARNING.md
+backtest-cache-*.json
+.claude/

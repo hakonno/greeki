@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
-use spotwatt_core::plan;
+use spotwatt_core::{plan, JobSpec};
 
 use crate::model::Job;
 use crate::{db, executor, AppState};
@@ -32,7 +32,18 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     let mut runnable: Vec<Job> = Vec::new();
 
     for job in pending {
-        let decision = plan(&job.spec(), &prices, now);
+        // Plan with the learned runtime when we have enough history, otherwise
+        // the user's estimate.
+        let duration = db::learned_duration(&state.db, &job.command)
+            .await
+            .map(|(est, _)| est)
+            .unwrap_or(job.duration_minutes);
+        let spec = JobSpec {
+            policy: job.policy,
+            duration_minutes: duration,
+            deadline: job.deadline,
+        };
+        let decision = plan(&spec, &prices, now);
         db::set_scheduled_start(&state.db, job.id, decision.start_at.map(|d| d.timestamp()))
             .await
             .ok();

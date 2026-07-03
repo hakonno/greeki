@@ -6,11 +6,44 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Europe::Oslo;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
-use spotwatt_core::{interval_cost, plan, JobSpec, Policy, PriceSeries, Priority};
+use spotwatt_core::{
+    cheapest_window, interval_cost, plan, Estimate, JobSpec, Policy, PriceSeries, Priority, Window,
+};
 
+use crate::config::Config;
 use crate::model::{Job, JobStatus, Repeat};
 
 use super::style::CSS;
+
+/// What's already running, for explaining why a ready job hasn't launched.
+struct Load {
+    running: usize,
+    max_jobs: usize,
+    committed_watts: f64,
+    budget_watts: Option<f64>,
+}
+
+impl Load {
+    /// Why `job` can't be handed a slot right now, if anything blocks it.
+    fn blocked_reason(&self, job: &Job) -> Option<String> {
+        if self.running >= self.max_jobs {
+            return Some(format!(
+                "ready — waiting for a free slot ({} of {} running)",
+                self.running, self.max_jobs
+            ));
+        }
+        if let Some(budget) = self.budget_watts {
+            let draw = job.power_watts.unwrap_or(0.0).max(0.0);
+            if self.committed_watts + draw > budget {
+                return Some(format!(
+                    "ready — waiting for power-budget headroom ({:.0} of {:.0} W committed)",
+                    self.committed_watts, budget
+                ));
+            }
+        }
+        None
+    }
+}
 
 pub(super) fn layout(body: Markup) -> Markup {
     html! {
@@ -28,12 +61,24 @@ pub(super) fn layout(body: Markup) -> Markup {
     }
 }
 
-pub(super) fn render_prices(prices: &PriceSeries, now: DateTime<Utc>) -> Markup {
+pub(super) fn render_prices(
+    prices: &PriceSeries,
+    raw_spot: &PriceSeries,
+    vat_rate: f64,
+    now: DateTime<Utc>,
+) -> Markup {
     if prices.is_empty() {
         return html! { p.muted { "No price data yet — fetching…" } };
     }
 
     let current = prices.price_at(now);
+    // The spot price incl. VAT — the number hvakosterstrommen.no shows, so
+    // users can sanity-check us against it.
+    let spot_mva = |t: DateTime<Utc>| {
+        raw_spot
+            .price_at(t)
+            .map(|p| p.nok_per_kwh * (1.0 + vat_rate))
+    };
     let min = prices.min_point();
     let max = prices.max_point();
     let avg = prices.avg_nok();
@@ -47,10 +92,16 @@ pub(super) fn render_prices(prices: &PriceSeries, now: DateTime<Utc>) -> Markup 
         .fold(0.0_f64, f64::max)
         .max(0.0001);
 
+    let win2 = cheapest_window(prices, now, None, 2);
+    let win4 = cheapest_window(prices, now, None, 4);
+
     html! {
         div.summary {
             @if let Some(c) = current {
-                div.stat { span.label { "now" } span.value { (fmt_kr(c.nok_per_kwh)) } }
+                div.stat { span.label { "now (effective)" } span.value { (fmt_kr(c.nok_per_kwh)) } }
+            }
+            @if let Some(s) = spot_mva(now) {
+                div.stat { span.label { "spot now (m/mva)" } span.value { (fmt_kr(s)) } }
             }
             @if let Some(a) = avg {
                 div.stat { span.label { "avg" } span.value { (fmt_kr(a)) } }
@@ -66,26 +117,61 @@ pub(super) fn render_prices(prices: &PriceSeries, now: DateTime<Utc>) -> Markup 
             @for p in &upcoming {
                 @let h = (p.nok_per_kwh / scale * 100.0).max(3.0);
                 @let kind = if p.contains(now) { "now" } else if Some(p.start) == cheapest_start { "cheap" } else { "" };
-                div.bar-wrap title=(format!("{} – {:.3} kr", fmt_oslo_hm(p.start), p.nok_per_kwh)) {
+                @let tip = match spot_mva(p.start) {
+                    Some(s) => format!("{} – {:.2} kr effective · spot {:.2} kr m/mva",
+                        fmt_oslo_hm(p.start), p.nok_per_kwh, s),
+                    None => format!("{} – {:.2} kr effective", fmt_oslo_hm(p.start), p.nok_per_kwh),
+                };
+                div.bar-wrap title=(tip) {
                     div class=(format!("bar {}", kind)) style=(format!("height:{:.1}%", h)) {}
                     span.hour { (p.start.with_timezone(&Oslo).format("%H").to_string()) }
                 }
             }
         }
-        p.muted { "Known horizon: " (prices.len()) " hours. 🟡 Yellow = current hour. 🟢 Green = cheapest. Effective price: spot + nettleie + elavgift + MVA − strømstøtte." }
+        @if win2.is_some() || win4.is_some() {
+            div.windows {
+                @if let Some(w) = &win2 { span { "cheapest 2 h: " span.good { (fmt_window(w)) } } }
+                @if let Some(w) = &win4 { span { "cheapest 4 h: " span.good { (fmt_window(w)) } } }
+            }
+        }
+        p.muted {
+            "Known horizon: " (prices.len()) " hours. 🟡 Yellow = current hour. 🟢 Green = cheapest. "
+            "Bars show the effective price: spot + nettleie + elavgift + MVA − strømstøtte. "
+            "“Spot m/mva” is the number "
+            a href="https://www.hvakosterstrommen.no" { "hvakosterstrommen.no" }
+            " shows."
+        }
     }
+}
+
+/// "Fri 03 Jul 15:00–17:00 · avg 0.98 kr/kWh"
+fn fmt_window(w: &Window) -> String {
+    format!(
+        "{}–{} · avg {:.2} kr/kWh",
+        fmt_oslo(w.start),
+        fmt_oslo_hm(w.end),
+        w.avg_nok
+    )
 }
 
 pub(super) fn render_jobs(
     jobs: &[Job],
-    learned: &HashMap<i64, (i64, usize)>,
+    learned: &HashMap<i64, Estimate>,
     savings: Option<(f64, i64)>,
     prices: &PriceSeries,
+    config: &Config,
     now: DateTime<Utc>,
 ) -> Markup {
     if jobs.is_empty() {
         return html! { p.muted { "No jobs yet. Add one above." } };
     }
+    let running: Vec<&Job> = jobs.iter().filter(|j| j.status == JobStatus::Running).collect();
+    let load = Load {
+        running: running.len(),
+        max_jobs: config.max_concurrent_jobs,
+        committed_watts: running.iter().filter_map(|j| j.power_watts).sum(),
+        budget_watts: config.max_power_watts,
+    };
     html! {
         @if let Some((saved, n)) = savings {
             @if n > 0 {
@@ -98,7 +184,7 @@ pub(super) fn render_jobs(
         }
         div.jobs {
             @for job in jobs {
-                (render_job(job, learned.get(&job.id).copied(), prices, now))
+                (render_job(job, learned.get(&job.id).copied(), prices, &load, now))
             }
         }
     }
@@ -106,13 +192,14 @@ pub(super) fn render_jobs(
 
 fn render_job(
     job: &Job,
-    learned: Option<(i64, usize)>,
+    learned: Option<Estimate>,
     prices: &PriceSeries,
+    load: &Load,
     now: DateTime<Utc>,
 ) -> Markup {
     // Plan with the measured runtime when we have enough history, otherwise the
     // user's estimate.
-    let eff_minutes = learned.map(|(est, _)| est).unwrap_or(job.duration_minutes);
+    let eff_minutes = learned.map(|e| e.minutes).unwrap_or(job.duration_minutes);
     let spec = JobSpec {
         policy: job.policy,
         duration_minutes: eff_minutes,
@@ -162,9 +249,12 @@ fn render_job(
                 @if job.status == JobStatus::Pending || job.status == JobStatus::Running {
                     span {
                         "⏱ est. " (dur_label(job.duration_minutes))
-                        @if let Some((est, n)) = learned {
-                            @if est != job.duration_minutes {
-                                span.learned { " (measured ~" (dur_label(est)) " over " (n) " runs)" }
+                        @if let Some(e) = learned {
+                            @if e.minutes != job.duration_minutes {
+                                span.learned {
+                                    " (measured ~" (dur_label(e.minutes)) " over " (e.runs)
+                                    @if e.exact { " runs)" } @else { " similar runs)" }
+                                }
                             }
                         }
                     }
@@ -180,8 +270,15 @@ fn render_job(
             }
 
             @if let Some(d) = &decision {
+                // The planner's reason assumes launch is instant; when the
+                // slot count or power budget is what's actually holding the
+                // job back, say that instead.
+                @let queued = if d.run_now { load.blocked_reason(job) } else { None };
                 div.plan {
-                    span.reason { (d.reason) }
+                    @match &queued {
+                        Some(q) => span.reason.queued { (q) },
+                        None => span.reason { (d.reason) },
+                    }
                     @if let Some(start) = d.start_at {
                         @if !d.run_now {
                             span.when { "→ starts " (fmt_oslo(start)) }
@@ -235,7 +332,7 @@ pub(super) fn add_form() -> Markup {
     html! {
         form hx-post="/jobs" hx-target="#jobs" hx-swap="innerHTML" {
             label.wide { "Command"
-                textarea name="command" rows="2" placeholder="restic backup /data"
+                textarea name="command" rows="2" placeholder="restic backup /data" required
                     hx-get="/fragment/cmd-hint" hx-trigger="change, keyup changed delay:500ms"
                     hx-target="#cmd-hint" hx-swap="innerHTML" {}
                 small #cmd-hint .hint {}
@@ -246,8 +343,9 @@ pub(super) fn add_form() -> Markup {
                     select name="policy" {
                         option value="cheapest" { "Cheapest window" }
                         option value="threshold" { "Below threshold" }
-                        option value="immediate" { "Immediate (critical)" }
+                        option value="immediate" { "Immediate (ignore price)" }
                     }
+                    small.hint { "When to start, given the price." }
                 }
                 label { "Est. duration (min)"
                     input #duration-input type="number" name="duration_minutes" value="60" min="1";
@@ -269,6 +367,7 @@ pub(super) fn add_form() -> Markup {
                         option value="high" { "High" }
                         option value="critical" { "Critical" }
                     }
+                    small.hint { "Who goes first when job slots are scarce. Unrelated to price." }
                 }
                 label { "Repeat"
                     select name="repeat" {

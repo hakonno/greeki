@@ -9,7 +9,7 @@ mod web;
 use std::sync::Arc;
 
 use spotwatt_core::PriceSeries;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing_subscriber::EnvFilter;
 
 /// Everything the request handlers and background tasks share.
@@ -18,6 +18,10 @@ pub struct AppState {
     /// Latest known price curve. Refreshed by the price task, read everywhere.
     pub prices: RwLock<PriceSeries>,
     pub config: config::Config,
+    /// Poked whenever something happens that could make a job startable right
+    /// now — a job is created, or a running one finishes and frees a slot — so
+    /// the scheduler re-plans immediately instead of waiting out its tick.
+    pub kick: Notify,
 }
 
 #[tokio::main]
@@ -43,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         prices: RwLock::new(PriceSeries::default()),
         config: config.clone(),
+        kick: Notify::new(),
     });
 
     // Background workers: keep prices fresh and re-plan jobs on every tick.

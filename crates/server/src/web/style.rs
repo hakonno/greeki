@@ -23,6 +23,9 @@ padding:18px 20px;margin-bottom:20px}
 .bar.now{background:var(--accent)} .bar.cheap{background:var(--good)}
 .hour{font-size:9px;color:var(--muted);margin-top:3px}
 .muted{color:var(--muted);font-size:13px}
+.muted a{color:var(--muted)}
+.windows{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-top:10px}
+.windows .good{color:var(--good)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:14px}
 label{display:flex;flex-direction:column;font-size:12px;color:var(--muted);gap:4px}
 input,select,textarea{background:var(--bg);border:1px solid var(--line);color:var(--fg);
@@ -32,6 +35,8 @@ textarea{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical
 .hint{display:block;font-size:11px;color:var(--muted);margin-top:3px;font-weight:400}
 .learned{color:var(--good)}
 .recognized{color:var(--good)}
+.warnhint{display:block;font-size:11px;color:var(--accent);margin-top:3px}
+.plan .reason.queued{color:var(--accent)}
 button{background:var(--blue);color:#fff;border:0;border-radius:8px;padding:8px 14px;
 font-size:13px;cursor:pointer}
 button:hover{filter:brightness(1.1)}
@@ -59,6 +64,8 @@ padding:3px 8px;font-size:13px;display:inline-block;color:#cdd6e3}
 .savings{display:flex;gap:14px;font-size:13px;margin-top:4px}
 .savings .good,.result .good{color:var(--good)}
 .rollup{font-size:13px;color:var(--good);margin:0 0 10px}
+.errors{color:var(--bad);border:1px solid var(--bad);border-radius:8px;
+padding:8px 12px;margin:0 0 12px;font-size:13px}
 .result{display:flex;gap:16px;color:var(--muted);font-size:13px;margin-top:6px}
 details{margin-top:8px} summary{cursor:pointer;color:var(--muted);font-size:13px}
 pre{background:#0b0d12;border:1px solid var(--line);border-radius:6px;

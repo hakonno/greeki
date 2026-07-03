@@ -9,15 +9,19 @@ use spotwatt_core::{plan, select_within_budget, JobSpec};
 use crate::model::Job;
 use crate::{db, executor, AppState};
 
-/// Re-evaluate all pending jobs on a fixed interval. Each tick is stateless:
-/// it asks the core planner what each job should do *right now* given the
-/// latest prices, persists the projected start time for display, and launches
-/// any job that should run — subject to the concurrency cap.
+/// Re-evaluate all pending jobs on a fixed interval — or immediately when the
+/// rest of the app kicks us (job submitted, job finished). Each tick is
+/// stateless: it asks the core planner what each job should do *right now*
+/// given the latest prices, persists the projected start time for display,
+/// and launches any job that should run — subject to the concurrency cap.
 pub async fn run(state: Arc<AppState>) {
     let period = Duration::from_secs(state.config.tick_seconds.max(5));
     let mut ticker = tokio::time::interval(period);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = state.kick.notified() => {}
+        }
         if let Err(e) = tick(&state).await {
             tracing::warn!("scheduler tick failed: {e:?}");
         }
@@ -44,12 +48,15 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     let pending = db::pending_jobs(&state.db).await?;
     let mut runnable: Vec<Job> = Vec::new();
 
+    // One history scan per tick; every job estimates against it.
+    let learner = db::duration_learner(&state.db).await?;
+
     for job in pending {
         // Plan with the learned runtime when we have enough history, otherwise
         // the user's estimate.
-        let duration = db::learned_duration(&state.db, &job.command)
-            .await
-            .map(|(est, _)| est)
+        let duration = learner
+            .estimate(&job.command)
+            .map(|e| e.minutes)
             .unwrap_or(job.duration_minutes);
         let spec = JobSpec {
             policy: job.policy,

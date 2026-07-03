@@ -58,7 +58,9 @@ pub struct Tariff {
     /// kr/kWh ex-VAT.
     #[serde(default = "d_grid_night")]
     pub grid_energy_night_nok_per_kwh: f64,
-    /// Electricity tax (elavgift / forbruksavgift), kr/kWh ex-VAT.
+    /// Electricity tax (elavgift / forbruksavgift), kr/kWh ex-VAT. The rate is
+    /// set in the state budget and changes yearly (0.0713 flat for 2026; 2025
+    /// was 0.1644 with a reduced winter rate).
     #[serde(default = "d_elavgift")]
     pub electricity_tax_nok_per_kwh: f64,
     /// Value-added tax (MVA) as a fraction. 0.25 for most of Norway; set 0.0
@@ -66,7 +68,8 @@ pub struct Tariff {
     #[serde(default = "d_vat")]
     pub vat_rate: f64,
     /// Spot price (ex-VAT) above which strømstøtte begins to refund, kr/kWh.
-    /// Ignored under Norgespris.
+    /// Adjusted yearly: 0.77 for 2026 (96.25 øre incl-VAT), up from 0.75 in
+    /// 2025. Ignored under Norgespris.
     #[serde(default = "d_subsidy_threshold")]
     pub subsidy_threshold_nok_per_kwh: f64,
     /// Fraction of the spot price *above* the threshold that is refunded.
@@ -88,13 +91,13 @@ fn d_grid_night() -> f64 {
     0.32
 }
 fn d_elavgift() -> f64 {
-    0.1644
+    0.0713
 }
 fn d_vat() -> f64 {
     0.25
 }
 fn d_subsidy_threshold() -> f64 {
-    0.9375
+    0.77
 }
 fn d_subsidy_rate() -> f64 {
     0.90
@@ -208,10 +211,10 @@ mod tests {
     #[test]
     fn adds_grid_tax_and_vat_below_threshold() {
         let t = Tariff::default();
-        // 0.50 spot, daytime, no subsidy: (0.50 + 0.40 + 0.1644) * 1.25
+        // 0.50 spot, daytime, no subsidy: (0.50 + 0.40 + 0.0713) * 1.25
         approx(
             t.effective_at(0.50, weekday_noon()),
-            (0.50 + 0.40 + 0.1644) * 1.25,
+            (0.50 + 0.40 + 0.0713) * 1.25,
         );
         approx(t.subsidy(0.50), 0.0);
     }
@@ -219,7 +222,7 @@ mod tests {
     #[test]
     fn night_and_weekend_use_the_cheap_grid_rate() {
         let t = Tariff::default();
-        let night = (0.50 + 0.32 + 0.1644) * 1.25;
+        let night = (0.50 + 0.32 + 0.0713) * 1.25;
         approx(t.effective_at(0.50, weekday_night()), night);
         approx(t.effective_at(0.50, saturday_noon()), night);
     }
@@ -227,13 +230,13 @@ mod tests {
     #[test]
     fn subsidy_compresses_the_expensive_end() {
         let t = Tariff::default();
-        // At 2.0 kr spot, 90% of (2.0 - 0.9375) is refunded.
-        let expected_subsidy = 0.90 * (2.0 - 0.9375);
+        // At 2.0 kr spot, 90% of (2.0 - 0.77) is refunded.
+        let expected_subsidy = 0.90 * (2.0 - 0.77);
         approx(t.subsidy(2.0), expected_subsidy);
         let net = 2.0 - expected_subsidy;
         approx(
             t.effective_at(2.0, weekday_noon()),
-            (net + 0.40 + 0.1644) * 1.25,
+            (net + 0.40 + 0.0713) * 1.25,
         );
     }
 
@@ -259,7 +262,7 @@ mod tests {
             energy_model: EnergyModel::Norgespris,
             ..Tariff::default()
         };
-        let expected = (0.40 + 0.40 + 0.1644) * 1.25;
+        let expected = (0.40 + 0.40 + 0.0713) * 1.25;
         approx(t.effective_at(0.05, weekday_noon()), expected);
         approx(t.effective_at(5.00, weekday_noon()), expected);
     }

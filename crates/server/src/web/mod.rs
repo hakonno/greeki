@@ -14,7 +14,7 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Europe::Oslo;
 use maud::{html, Markup};
 use serde::Deserialize;
-use spotwatt_core::{Policy, PriceSeries, Priority};
+use spotwatt_core::{Estimate, Policy, PriceSeries, Priority};
 
 use crate::model::{Job, NewJob, Repeat};
 use crate::{db, executor, AppState};
@@ -41,7 +41,8 @@ pub fn router(state: Arc<AppState>) -> Router {
 // ---------------------------------------------------------------------------
 
 async fn index(State(state): State<Arc<AppState>>) -> Markup {
-    let effective = state.prices.read().await.with_tariff(&state.config.tariff);
+    let raw = state.prices.read().await.clone();
+    let effective = raw.with_tariff(&state.config.tariff);
     let (jobs, learned, savings) = jobs_with_learning(&state).await;
     let now = Utc::now();
 
@@ -52,9 +53,9 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         }
 
         section.card {
-            h2 { "Power price (effective)" }
+            h2 { "Power price" }
             div #prices hx-get="/fragment/prices" hx-trigger="every 30s" hx-swap="innerHTML" {
-                (render_prices(&effective, now))
+                (render_prices(&effective, &raw, state.config.tariff.vat_rate, now))
             }
         }
 
@@ -66,7 +67,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         section.card {
             h2 { "Jobs" }
             div #jobs hx-get="/fragment/jobs" hx-trigger="every 5s" hx-swap="innerHTML" {
-                (render_jobs(&jobs, &learned, savings, &effective, now))
+                (render_jobs(&jobs, &learned, savings, &effective, &state.config, now))
             }
         }
 
@@ -77,26 +78,29 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
 }
 
 async fn prices_fragment(State(state): State<Arc<AppState>>) -> Markup {
-    let effective = state.prices.read().await.with_tariff(&state.config.tariff);
-    render_prices(&effective, Utc::now())
+    let raw = state.prices.read().await.clone();
+    let effective = raw.with_tariff(&state.config.tariff);
+    render_prices(&effective, &raw, state.config.tariff.vat_rate, Utc::now())
 }
 
 async fn jobs_fragment(State(state): State<Arc<AppState>>) -> Markup {
     let effective = state.prices.read().await.with_tariff(&state.config.tariff);
     let (jobs, learned, savings) = jobs_with_learning(&state).await;
-    render_jobs(&jobs, &learned, savings, &effective, Utc::now())
+    render_jobs(&jobs, &learned, savings, &effective, &state.config, Utc::now())
 }
 
 /// Load all jobs together with each job's learned runtime (when it has enough
 /// history, keyed by job id) and the all-time savings rollup.
 async fn jobs_with_learning(
     state: &AppState,
-) -> (Vec<Job>, HashMap<i64, (i64, usize)>, Option<(f64, i64)>) {
+) -> (Vec<Job>, HashMap<i64, Estimate>, Option<(f64, i64)>) {
     let jobs = db::list_jobs(&state.db).await.unwrap_or_default();
     let mut learned = HashMap::new();
-    for job in &jobs {
-        if let Some(info) = db::learned_duration(&state.db, &job.command).await {
-            learned.insert(job.id, info);
+    if let Ok(learner) = db::duration_learner(&state.db).await {
+        for job in &jobs {
+            if let Some(est) = learner.estimate(&job.command) {
+                learned.insert(job.id, est);
+            }
         }
     }
     let savings = db::savings_rollup(&state.db).await.ok();
@@ -120,47 +124,122 @@ async fn create_job(
     State(state): State<Arc<AppState>>,
     Form(form): Form<CreateForm>,
 ) -> Markup {
-    let name = form.name.trim().to_string();
-    let command = form.command.trim().to_string();
-
-    if !name.is_empty() && !command.is_empty() {
-        let policy = match form.policy.as_str() {
-            "immediate" => Policy::Immediate,
-            "threshold" => Policy::Threshold {
-                max_nok_per_kwh: parse_f64(&form.threshold_nok).unwrap_or(0.5),
-            },
-            _ => Policy::CheapestWindow,
-        };
-        let priority = match form.priority.as_deref().unwrap_or("normal") {
-            "low" => Priority::Low,
-            "high" => Priority::High,
-            "critical" => Priority::Critical,
-            _ => Priority::Normal,
-        };
-        let repeat = match form.repeat.as_deref().unwrap_or("none") {
-            "daily" => Repeat::Daily,
-            _ => Repeat::None,
-        };
-        let new = NewJob {
-            name,
-            command,
-            policy,
-            duration_minutes: parse_i64(&form.duration_minutes).unwrap_or(60).max(1),
-            deadline: form.deadline.as_deref().and_then(parse_deadline),
-            power_watts: parse_f64(&form.power_watts),
-            priority,
-            repeat,
-            earliest_start: None,
-            created_at: Utc::now(),
-        };
-        if let Err(e) = db::create_job(&state.db, new).await {
-            tracing::warn!("create job failed: {e:?}");
+    let errors = match validate(&form) {
+        Ok(new) => {
+            if let Err(e) = db::create_job(&state.db, new).await {
+                tracing::warn!("create job failed: {e:?}");
+                vec!["saving the job failed — see the server log".to_string()]
+            } else {
+                // Wake the scheduler so an immediately-runnable job starts in
+                // milliseconds, not at the next tick.
+                state.kick.notify_one();
+                Vec::new()
+            }
         }
-    }
+        Err(errors) => errors,
+    };
 
     let effective = state.prices.read().await.with_tariff(&state.config.tariff);
     let (jobs, learned, savings) = jobs_with_learning(&state).await;
-    render_jobs(&jobs, &learned, savings, &effective, Utc::now())
+    html! {
+        @if !errors.is_empty() {
+            div.errors {
+                "⚠ job not created: " (errors.join(" · "))
+            }
+        }
+        (render_jobs(&jobs, &learned, savings, &effective, &state.config, Utc::now()))
+    }
+}
+
+/// Turn the raw form into a `NewJob`, or every reason it can't be one. The
+/// old behavior — silently dropping the submission or papering over bad
+/// values with defaults — meant a typo could quietly schedule the wrong job.
+fn validate(form: &CreateForm) -> Result<NewJob, Vec<String>> {
+    let mut errors = Vec::new();
+    let name = form.name.trim().to_string();
+    let command = form.command.trim().to_string();
+
+    if name.is_empty() {
+        errors.push("name is required".to_string());
+    }
+    if command.is_empty() {
+        errors.push("command is required".to_string());
+    }
+
+    let policy = match form.policy.as_str() {
+        "immediate" => Policy::Immediate,
+        "threshold" => match parse_f64(&form.threshold_nok) {
+            Some(max) if max > 0.0 => Policy::Threshold { max_nok_per_kwh: max },
+            _ => {
+                errors.push(
+                    "the below-threshold policy needs a threshold (kr/kWh) above 0".to_string(),
+                );
+                Policy::CheapestWindow
+            }
+        },
+        _ => Policy::CheapestWindow,
+    };
+
+    let duration_minutes = match (&form.duration_minutes, parse_i64(&form.duration_minutes)) {
+        (_, Some(m)) if m >= 1 => m,
+        (raw, _) if is_blank(raw) => 60,
+        _ => {
+            errors.push("duration must be a whole number of minutes ≥ 1".to_string());
+            60
+        }
+    };
+
+    let deadline = match (&form.deadline, form.deadline.as_deref().and_then(parse_deadline)) {
+        (raw, None) if !is_blank(raw) => {
+            errors.push("deadline could not be parsed".to_string());
+            None
+        }
+        (_, Some(dl)) if dl <= Utc::now() => {
+            errors.push("deadline is in the past".to_string());
+            None
+        }
+        (_, dl) => dl,
+    };
+
+    let power_watts = match (&form.power_watts, parse_f64(&form.power_watts)) {
+        (_, Some(w)) if w > 0.0 => Some(w),
+        (raw, _) if is_blank(raw) => None,
+        _ => {
+            errors.push("power must be a number of watts above 0".to_string());
+            None
+        }
+    };
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let priority = match form.priority.as_deref().unwrap_or("normal") {
+        "low" => Priority::Low,
+        "high" => Priority::High,
+        "critical" => Priority::Critical,
+        _ => Priority::Normal,
+    };
+    let repeat = match form.repeat.as_deref().unwrap_or("none") {
+        "daily" => Repeat::Daily,
+        _ => Repeat::None,
+    };
+    Ok(NewJob {
+        name,
+        command,
+        policy,
+        duration_minutes,
+        deadline,
+        power_watts,
+        priority,
+        repeat,
+        earliest_start: None,
+        created_at: Utc::now(),
+    })
+}
+
+fn is_blank(o: &Option<String>) -> bool {
+    o.as_deref().map_or(true, |s| s.trim().is_empty())
 }
 
 async fn cancel(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Markup {
@@ -207,17 +286,33 @@ async fn cmd_hint(State(state): State<Arc<AppState>>, Query(q): Query<CmdQuery>)
     if command.is_empty() {
         return html! {};
     }
-    match db::learned_duration(&state.db, command).await {
-        Some((est, n)) => html! {
+    let est = match db::duration_learner(&state.db).await {
+        Ok(learner) => learner.estimate(command),
+        Err(_) => None,
+    };
+    let compound = spotwatt_core::has_shell_operators(command);
+    html! {
+        @if compound {
+            span.warnhint {
+                "⚠ compound command (;, &, |, $()) — runs as one job under sh -c, and its "
+                "duration is only learned from exact repeats of the whole line."
+            }
+        }
+        @if let Some(e) = est {
             span.recognized {
-                "✓ seen this command before — measured ~" (dur_label(est)) " over " (n)
-                " runs (filled in below; the scheduler uses this)"
+                @if e.exact {
+                    "✓ seen this command before — measured ~" (dur_label(e.minutes))
+                    " over " (e.runs) " runs"
+                } @else {
+                    "≈ similar commands (“" (spotwatt_core::command_signature(command))
+                    "”) measured ~" (dur_label(e.minutes)) " over " (e.runs) " runs"
+                }
+                " (filled in below; the scheduler uses this)"
             }
             // Out-of-band: replace the duration input with the learned value.
             input #duration-input type="number" name="duration_minutes" min="1"
-                value=(est) hx-swap-oob="true";
-        },
-        None => html! {},
+                value=(e.minutes) hx-swap-oob="true";
+        }
     }
 }
 

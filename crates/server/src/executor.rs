@@ -120,6 +120,10 @@ pub async fn run_job(state: Arc<AppState>, job: Job, started: DateTime<Utc>) {
         status.as_str(),
         exit_code
     );
+
+    // A slot just freed up — let the scheduler hand it to a waiting job now
+    // rather than at the next tick.
+    state.kick.notify_one();
 }
 
 /// Kill a timed-out job's whole process group. The shell was spawned as its

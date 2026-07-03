@@ -20,7 +20,7 @@ mod testutil;
 
 pub use cost::interval_cost;
 pub use job::{JobSpec, Policy, Priority};
-pub use learn::estimate_minutes;
+pub use learn::{command_signature, estimate_minutes, has_shell_operators, DurationLearner, Estimate};
 pub use price::{PricePoint, PriceSeries};
 pub use schedule::{plan, Plan};
 pub use select::select_within_budget;

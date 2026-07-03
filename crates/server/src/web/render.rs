@@ -96,8 +96,15 @@ pub(super) fn render_prices(
     let max = prices.max_point();
     let avg = prices.avg_nok();
 
-    // Show the current hour onward (the schedulable horizon).
+    // Show the current hour onward (the schedulable horizon). Stale data —
+    // every known hour already past — would otherwise render an empty chart
+    // with misleading stats from yesterday.
     let upcoming: Vec<_> = prices.points.iter().filter(|p| p.end > now).collect();
+    if upcoming.is_empty() {
+        return html! {
+            p.muted { "Price data has gone stale — every known hour is in the past. Waiting for the next fetch…" }
+        };
+    }
     let hi = upcoming
         .iter()
         .map(|p| p.nok_per_kwh)
@@ -143,9 +150,11 @@ pub(super) fn render_prices(
             ),
             None => format!("{} – {:.2} kr effective", fmt_oslo_hm(p.start), p.nok_per_kwh),
         };
+        // The "now" label overflows its slot, so keep interval labels a
+        // couple of bars away from it.
         let label = if is_now {
             Some("now".to_string())
-        } else if local.hour() % 3 == 0 {
+        } else if local.hour() % 3 == 0 && (p.start - now).num_hours() > 1 {
             Some(local.format("%H").to_string())
         } else {
             None
@@ -488,7 +497,7 @@ fn add_form() -> Markup {
                     small.hint { "When to start, given the price." }
                 }
                 label.threshold-field { "Threshold (kr/kWh)"
-                    input type="number" step="0.01" name="threshold_nok" placeholder="1.20";
+                    input type="number" step="any" name="threshold_nok" placeholder="1.20";
                     small.hint { "Against the effective price in the chart, not raw spot." }
                 }
                 label { "Est. duration (min)"

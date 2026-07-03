@@ -19,7 +19,7 @@ use spotwatt_core::{Estimate, Policy, PriceSeries, Priority};
 use crate::model::{Job, NewJob, Repeat};
 use crate::{db, executor, AppState};
 
-use render::{add_form, dur_label, layout, render_jobs, render_prices};
+use render::{add_job_panel, dur_label, layout, render_jobs, render_prices};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -48,8 +48,8 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
 
     layout(html! {
         header {
-            h1 { "spotwatt" }
-            p.tag { "power-price-aware compute scheduler · region " (state.config.region) }
+            h1 { "spot" span.w { "watt" } }
+            p.tag { "price-aware job scheduler · " (state.config.region) " · all times Oslo" }
         }
 
         section.card {
@@ -60,8 +60,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         }
 
         section.card {
-            h2 { "Add a job" }
-            (add_form())
+            (add_job_panel(jobs.is_empty(), false))
         }
 
         section.card {
@@ -72,7 +71,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Markup {
         }
 
         footer {
-            p { "Prices from hvakosterstrommen.no · the API only knows ~24–48h ahead, so plans are re-evaluated every tick." }
+            p { "prices from hvakosterstrommen.no · horizon ~24–48 h · plans re-evaluated every tick" }
         }
     })
 }
@@ -143,9 +142,13 @@ async fn create_job(
     let (jobs, learned, savings) = jobs_with_learning(&state).await;
     html! {
         @if !errors.is_empty() {
-            div.errors {
-                "⚠ job not created: " (errors.join(" · "))
+            div.errors role="alert" {
+                "Job not created: " (errors.join(" · "))
             }
+        } @else {
+            // Out-of-band: replace the add-job panel with a fresh, collapsed
+            // one so a successful create clears the form.
+            (add_job_panel(false, true))
         }
         (render_jobs(&jobs, &learned, savings, &effective, &state.config, Utc::now()))
     }
@@ -346,4 +349,134 @@ fn parse_deadline(s: &str) -> Option<DateTime<Utc>> {
     Oslo.from_local_datetime(&naive)
         .earliest()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use chrono::{Duration, TimeZone};
+    use spotwatt_core::PricePoint;
+
+    use crate::config::Config;
+    use crate::model::JobStatus;
+
+    fn pt(start: DateTime<Utc>, nok: f64) -> PricePoint {
+        PricePoint {
+            start,
+            end: start + Duration::hours(1),
+            nok_per_kwh: nok,
+            eur_per_kwh: nok / 11.5,
+        }
+    }
+
+    fn job(id: i64, name: &str, cmd: &str, status: JobStatus, now: DateTime<Utc>) -> Job {
+        Job {
+            id,
+            name: name.into(),
+            command: cmd.into(),
+            policy: Policy::CheapestWindow,
+            duration_minutes: 60,
+            deadline: None,
+            power_watts: None,
+            priority: Priority::Normal,
+            repeat: Repeat::None,
+            earliest_start: None,
+            status,
+            scheduled_start: None,
+            created_at: now - Duration::hours(3),
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            output: None,
+            est_cost_nok: None,
+            baseline_cost_nok: None,
+        }
+    }
+
+    /// Not a real test: renders the dashboard with synthetic data so the
+    /// design can be eyeballed without a running server. Only fires when
+    /// SPOTWATT_PREVIEW_OUT names an output file.
+    #[test]
+    fn dump_dashboard() {
+        let Ok(path) = std::env::var("SPOTWATT_PREVIEW_OUT") else { return };
+        let now = Utc.with_ymd_and_hms(2026, 7, 3, 10, 30, 0).unwrap();
+
+        // Two July days: cheap night, morning ramp, evening peak.
+        let shape = [
+            0.55, 0.50, 0.48, 0.47, 0.50, 0.62, 0.85, 1.10, 1.25, 1.05, 0.90, 0.82,
+            0.78, 0.75, 0.72, 0.80, 0.95, 1.30, 1.60, 1.45, 1.15, 0.90, 0.70, 0.60,
+        ];
+        let base = Utc.with_ymd_and_hms(2026, 7, 2, 22, 0, 0).unwrap(); // Oslo midnight, Jul 3 (CEST)
+        let mut pts = Vec::new();
+        for d in 0..2 {
+            for (h, v) in shape.iter().enumerate() {
+                let f = if d == 1 { 0.92 } else { 1.0 };
+                pts.push(pt(base + Duration::hours((d * 24 + h) as i64), v * f));
+            }
+        }
+        let effective = PriceSeries::new(pts.clone());
+        let raw = PriceSeries::new(
+            pts.iter()
+                .map(|p| PricePoint { nok_per_kwh: (p.nok_per_kwh / 1.25) - 0.30, ..p.clone() })
+                .collect(),
+        );
+
+        let mut transcode = job(1, "transcode queue", "ffmpeg -i /media/in.mkv -c:v libx265 /media/out.mkv", JobStatus::Running, now);
+        transcode.started_at = Some(now - Duration::minutes(25));
+        transcode.duration_minutes = 90;
+        transcode.power_watts = Some(450.0);
+
+        let mut backup = job(2, "nightly backup", "restic backup /data", JobStatus::Pending, now);
+        backup.deadline = Some(Utc.with_ymd_and_hms(2026, 7, 4, 5, 0, 0).unwrap());
+        backup.power_watts = Some(150.0);
+        backup.repeat = Repeat::Daily;
+
+        let mut scrub = job(3, "zfs scrub", "zpool scrub tank", JobStatus::Pending, now);
+        scrub.policy = Policy::Threshold { max_nok_per_kwh: 1.00 };
+        scrub.power_watts = Some(900.0);
+        scrub.priority = Priority::Low;
+
+        let mut done = job(4, "photo derivatives", "generate-thumbs --all /photos", JobStatus::Completed, now);
+        done.started_at = Some(now - Duration::hours(9));
+        done.finished_at = Some(now - Duration::hours(9) + Duration::minutes(38));
+        done.exit_code = Some(0);
+        done.est_cost_nok = Some(0.42);
+        done.baseline_cost_nok = Some(0.97);
+        done.output = Some("processed 1841 files\n0 errors".into());
+
+        let mut failed = job(5, "model refresh", "python retrain.py --epochs 3", JobStatus::Failed, now);
+        failed.started_at = Some(now - Duration::hours(20));
+        failed.finished_at = Some(now - Duration::hours(20) + Duration::minutes(4));
+        failed.exit_code = Some(2);
+        failed.output = Some("Traceback (most recent call last):\n  File \"retrain.py\", line 12\nModuleNotFoundError: No module named 'torch'".into());
+
+        let jobs = vec![backup.clone(), scrub, failed, done, transcode];
+        let mut learned = HashMap::new();
+        learned.insert(2_i64, Estimate { minutes: 42, runs: 7, exact: true });
+
+        let mut config = Config::default();
+        config.max_concurrent_jobs = 2;
+        config.max_power_watts = Some(1000.0);
+
+        let markup = layout(html! {
+            header {
+                h1 { "spot" span.w { "watt" } }
+                p.tag { "price-aware job scheduler · NO3 · all times Oslo" }
+            }
+            section.card {
+                h2 { "Power price" }
+                div #prices { (render_prices(&effective, &raw, 0.25, now)) }
+            }
+            section.card { (add_job_panel(false, false)) }
+            section.card {
+                h2 { "Jobs" }
+                div #jobs { (render_jobs(&jobs, &learned, Some((14.73, 12)), &effective, &config, now)) }
+            }
+            footer {
+                p { "prices from hvakosterstrommen.no · horizon ~24–48 h · plans re-evaluated every tick" }
+            }
+        });
+        std::fs::write(&path, markup.into_string()).unwrap();
+        eprintln!("wrote {path}");
+    }
 }

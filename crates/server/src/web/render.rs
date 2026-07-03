@@ -1,9 +1,9 @@
-//! HTML generation for the dashboard: page layout, the price chart, job cards,
-//! and the add-job form. Handlers live in the parent module.
+//! HTML generation for the dashboard: page layout, the price horizon, job
+//! cards, and the add-job form. Handlers live in the parent module.
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use chrono_tz::Europe::Oslo;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use spotwatt_core::{
@@ -61,6 +61,19 @@ pub(super) fn layout(body: Markup) -> Markup {
     }
 }
 
+/// One column of the horizon chart: an hour bar, or the rule where the Oslo
+/// date flips.
+enum Col {
+    Day(String),
+    Bar {
+        pct: f64,
+        color: String,
+        is_now: bool,
+        tip: String,
+        label: Option<String>,
+    },
+}
+
 pub(super) fn render_prices(
     prices: &PriceSeries,
     raw_spot: &PriceSeries,
@@ -82,61 +95,147 @@ pub(super) fn render_prices(
     let min = prices.min_point();
     let max = prices.max_point();
     let avg = prices.avg_nok();
-    let cheapest_start = min.map(|p| p.start);
 
     // Show the current hour onward (the schedulable horizon).
     let upcoming: Vec<_> = prices.points.iter().filter(|p| p.end > now).collect();
-    let scale = upcoming
+    let hi = upcoming
         .iter()
         .map(|p| p.nok_per_kwh)
         .fold(0.0_f64, f64::max)
         .max(0.0001);
+    let lo = upcoming
+        .iter()
+        .map(|p| p.nok_per_kwh)
+        .fold(f64::INFINITY, f64::min)
+        .min(hi);
+    let span = (hi - lo).max(1e-9);
+    let avg_pct = avg.map(|a| (a / hi * 100.0).clamp(0.0, 100.0));
 
     let win2 = cheapest_window(prices, now, None, 2);
     let win4 = cheapest_window(prices, now, None, 4);
 
-    html! {
-        div.summary {
-            @if let Some(c) = current {
-                div.stat { span.label { "now (effective)" } span.value { (fmt_kr(c.nok_per_kwh)) } }
-            }
-            @if let Some(s) = spot_mva(now) {
-                div.stat { span.label { "spot now (m/mva)" } span.value { (fmt_kr(s)) } }
-            }
-            @if let Some(a) = avg {
-                div.stat { span.label { "avg" } span.value { (fmt_kr(a)) } }
-            }
-            @if let Some(m) = min {
-                div.stat.good { span.label { "min" } span.value { (fmt_kr(m.nok_per_kwh)) } }
-            }
-            @if let Some(m) = max {
-                div.stat.bad { span.label { "max" } span.value { (fmt_kr(m.nok_per_kwh)) } }
-            }
+    let mut cols = Vec::new();
+    let mut prev_day = None;
+    for p in &upcoming {
+        let local = p.start.with_timezone(&Oslo);
+        let day = local.date_naive();
+        if prev_day.is_some_and(|d| d != day) {
+            cols.push(Col::Day(local.format("%a").to_string().to_lowercase()));
         }
-        div.chart {
-            @for p in &upcoming {
-                @let h = (p.nok_per_kwh / scale * 100.0).max(3.0);
-                @let kind = if p.contains(now) { "now" } else if Some(p.start) == cheapest_start { "cheap" } else { "" };
-                @let tip = match spot_mva(p.start) {
-                    Some(s) => format!("{} – {:.2} kr effective · spot {:.2} kr m/mva",
-                        fmt_oslo_hm(p.start), p.nok_per_kwh, s),
-                    None => format!("{} – {:.2} kr effective", fmt_oslo_hm(p.start), p.nok_per_kwh),
-                };
-                div.bar-wrap title=(tip) {
-                    div class=(format!("bar {}", kind)) style=(format!("height:{:.1}%", h)) {}
-                    span.hour { (p.start.with_timezone(&Oslo).format("%H").to_string()) }
+        prev_day = Some(day);
+
+        // Color encodes where this hour sits between the horizon's cheapest
+        // (green) and dearest (red) hour; height encodes the absolute price.
+        let t = ((p.nok_per_kwh - lo) / span).clamp(0.0, 1.0);
+        let color = format!(
+            "hsl({:.0} {:.0}% {:.0}%)",
+            145.0 - 137.0 * t,
+            42.0 + 16.0 * t,
+            46.0 + 8.0 * t
+        );
+        let is_now = p.contains(now);
+        let tip = match spot_mva(p.start) {
+            Some(s) => format!(
+                "{} – {:.2} kr effective · spot {:.2} kr m/mva",
+                fmt_oslo_hm(p.start),
+                p.nok_per_kwh,
+                s
+            ),
+            None => format!("{} – {:.2} kr effective", fmt_oslo_hm(p.start), p.nok_per_kwh),
+        };
+        let label = if is_now {
+            Some("now".to_string())
+        } else if local.hour() % 3 == 0 {
+            Some(local.format("%H").to_string())
+        } else {
+            None
+        };
+        cols.push(Col::Bar {
+            pct: (p.nok_per_kwh / hi * 100.0).max(2.0),
+            color,
+            is_now,
+            tip,
+            label,
+        });
+    }
+
+    html! {
+        div.readout {
+            @if let Some(c) = current {
+                div.now-price {
+                    span.label { "effective now" }
+                    span.value { (format!("{:.2}", c.nok_per_kwh)) small { " kr/kWh" } }
+                }
+            }
+            div.summary {
+                @if let Some(s) = spot_mva(now) {
+                    div.stat { span.label { "spot m/mva" } span.value { (fmt_kr(s)) } }
+                }
+                @if let Some(a) = avg {
+                    div.stat { span.label { "avg" } span.value { (fmt_kr(a)) } }
+                }
+                @if let Some(m) = min {
+                    div.stat.good {
+                        span.label { "min" }
+                        span.value { (fmt_kr(m.nok_per_kwh)) small { " · " (fmt_oslo_hm(m.start)) } }
+                    }
+                }
+                @if let Some(m) = max {
+                    div.stat.bad {
+                        span.label { "max" }
+                        span.value { (fmt_kr(m.nok_per_kwh)) small { " · " (fmt_oslo_hm(m.start)) } }
+                    }
                 }
             }
         }
-        @if win2.is_some() || win4.is_some() {
-            div.windows {
-                @if let Some(w) = &win2 { span { "cheapest 2 h: " span.good { (fmt_window(w)) } } }
-                @if let Some(w) = &win4 { span { "cheapest 4 h: " span.good { (fmt_window(w)) } } }
+        div.chart {
+            div.plot {
+                div.bars {
+                    @for col in &cols {
+                        @match col {
+                            Col::Day(d) => { div.sep { b { (d) } } }
+                            Col::Bar { pct, color, is_now, tip, .. } => {
+                                div.bar.now[*is_now] title=(tip)
+                                    style=(format!("height:{pct:.1}%;background:{color}")) {}
+                            }
+                        }
+                    }
+                    @if let Some(p) = avg_pct {
+                        div.avg-line style=(format!("bottom:{p:.1}%")) {}
+                    }
+                }
+            }
+            div.axis {
+                @for col in &cols {
+                    @match col {
+                        Col::Day(_) => { div.sp {} }
+                        Col::Bar { is_now, label, .. } => {
+                            div.h.now[*is_now] {
+                                @if let Some(l) = label { (l) }
+                            }
+                        }
+                    }
+                }
             }
         }
-        p.muted {
-            "Known horizon: " (prices.len()) " hours. 🟡 Yellow = current hour. 🟢 Green = cheapest. "
-            "Bars show the effective price: spot + nettleie + elavgift + MVA − strømstøtte. "
+        div.legend {
+            span { span.scale {} "cheap → expensive" }
+            span.now-key { "▾ now" }
+            span { "┄ avg" }
+            span { "horizon " (prices.len()) " h" }
+        }
+        @if win2.is_some() || win4.is_some() {
+            div.windows {
+                @if let Some(w) = &win2 {
+                    span.win { "cheapest 2 h " b { (fmt_window_range(w)) } (format!(" · avg {:.2} kr/kWh", w.avg_nok)) }
+                }
+                @if let Some(w) = &win4 {
+                    span.win { "cheapest 4 h " b { (fmt_window_range(w)) } (format!(" · avg {:.2} kr/kWh", w.avg_nok)) }
+                }
+            }
+        }
+        p.footnote {
+            "Bars show the effective price: spot + nettleie + elavgift + mva − strømstøtte. "
             "“Spot m/mva” is the number "
             a href="https://www.hvakosterstrommen.no" { "hvakosterstrommen.no" }
             " shows."
@@ -144,14 +243,9 @@ pub(super) fn render_prices(
     }
 }
 
-/// "Fri 03 Jul 15:00–17:00 · avg 0.98 kr/kWh"
-fn fmt_window(w: &Window) -> String {
-    format!(
-        "{}–{} · avg {:.2} kr/kWh",
-        fmt_oslo(w.start),
-        fmt_oslo_hm(w.end),
-        w.avg_nok
-    )
+/// "Fri 03 Jul 15:00–17:00"
+fn fmt_window_range(w: &Window) -> String {
+    format!("{}–{}", fmt_oslo(w.start), fmt_oslo_hm(w.end))
 }
 
 pub(super) fn render_jobs(
@@ -163,7 +257,9 @@ pub(super) fn render_jobs(
     now: DateTime<Utc>,
 ) -> Markup {
     if jobs.is_empty() {
-        return html! { p.muted { "No jobs yet. Add one above." } };
+        return html! {
+            p.empty { "No jobs yet. Open “new job” above — the scheduler waits for cheap hours on its own." }
+        };
     }
     let running: Vec<&Job> = jobs.iter().filter(|j| j.status == JobStatus::Running).collect();
     let load = Load {
@@ -172,18 +268,25 @@ pub(super) fn render_jobs(
         committed_watts: running.iter().filter_map(|j| j.power_watts).sum(),
         budget_watts: config.max_power_watts,
     };
+    // Active work first: running, then pending, then history (newest first
+    // within each group, which is the DB order).
+    let mut ordered: Vec<&Job> = jobs.iter().collect();
+    ordered.sort_by_key(|j| match j.status {
+        JobStatus::Running => 0,
+        JobStatus::Pending => 1,
+        _ => 2,
+    });
     html! {
         @if let Some((saved, n)) = savings {
             @if n > 0 {
                 p.rollup {
-                    "💰 est. " (fmt_kr(saved)) " saved vs starting each job on submit, over "
-                    (n) " priced run" @if n != 1 { "s" }
-                    " — measured against the effective tariff, not raw spot"
+                    "saved " b { (fmt_kr(saved)) } " vs running each job on submit · "
+                    (n) " priced run" @if n != 1 { "s" } " · measured against the effective tariff"
                 }
             }
         }
         div.jobs {
-            @for job in jobs {
+            @for job in &ordered {
                 (render_job(job, learned.get(&job.id).copied(), prices, &load, now))
             }
         }
@@ -234,38 +337,46 @@ fn render_job(
         div.job {
             div.job-head {
                 span.name { (job.name) }
-                span class=(format!("badge {}", status_class(job.status))) { (job.status.as_str()) }
+                span class=(format!("status {}", status_class(job.status))) { (job.status.as_str()) }
                 span.policy { (policy_label(&job.policy)) }
                 @if job.priority != Priority::Normal {
-                    span.prio { (priority_label(job.priority)) }
+                    span class=(format!("prio {}", priority_label(job.priority))) {
+                        (priority_label(job.priority))
+                    }
                 }
                 @if job.repeat == Repeat::Daily {
-                    span.prio { "↻ daily" }
+                    span.repeat { "↻ daily" }
                 }
             }
             div.cmd { code { (job.command) } }
 
             div.meta {
                 @if job.status == JobStatus::Pending || job.status == JobStatus::Running {
-                    span {
-                        "⏱ est. " (dur_label(job.duration_minutes))
+                    span.kv {
+                        span.k { "est" } (dur_label(job.duration_minutes))
                         @if let Some(e) = learned {
                             @if e.minutes != job.duration_minutes {
                                 span.learned {
-                                    " (measured ~" (dur_label(e.minutes)) " over " (e.runs)
-                                    @if e.exact { " runs)" } @else { " similar runs)" }
+                                    " · measured ~" (dur_label(e.minutes)) " over " (e.runs)
+                                    @if e.exact { " runs" } @else { " similar runs" }
                                 }
                             }
                         }
                     }
                 }
-                @if let Some(w) = job.power_watts { span { "⚡ " (format!("{:.0}", w)) " W" } }
-                @if let Some(e) = job.earliest_start {
-                    @if e > now { span { "⏳ not before " (fmt_oslo(e)) } }
+                @if let Some(w) = job.power_watts {
+                    span.kv { span.k { "draw" } (format!("{:.0} W", w)) }
                 }
-                @if let Some(dl) = job.deadline { span { "⛳ finish by " (fmt_oslo(dl)) } }
+                @if let Some(e) = job.earliest_start {
+                    @if e > now { span.kv { span.k { "not before" } (fmt_oslo(e)) } }
+                }
+                @if let Some(dl) = job.deadline {
+                    span.kv { span.k { "finish by" } (fmt_oslo(dl)) }
+                }
                 @if job.status == JobStatus::Running {
-                    @if let Some(f) = finish { span { "≈ done " (fmt_oslo(f)) } }
+                    @if let Some(f) = finish {
+                        span.kv { span.k { "done" } "~" (fmt_oslo(f)) }
+                    }
                 }
             }
 
@@ -294,31 +405,48 @@ fn render_job(
                         @if save > 0.01 {
                             span.good { "saves ~" (fmt_kr(save)) " vs now" }
                         }
-                        span.muted { "est. " (fmt_kr(wcost)) }
+                        span.muted { "est. cost " (fmt_kr(wcost)) }
                     }
                 }
             }
 
             @if job.status == JobStatus::Completed || job.status == JobStatus::Failed {
                 div.result {
-                    @if let Some(c) = job.exit_code { span { "exit " (c) } }
-                    @if let Some(secs) = elapsed_secs(job) { span { "took " (elapsed_label(secs)) } }
-                    @if let Some(s) = job.started_at { span { "ran " (fmt_oslo(s)) } }
-                    @if let Some(cost) = job.est_cost_nok { span { "cost " (fmt_kr(cost)) } }
+                    @if let Some(c) = job.exit_code {
+                        span class=(if c == 0 { "kv" } else { "kv bad" }) {
+                            span.k { "exit" } (c)
+                        }
+                    }
+                    @if let Some(secs) = elapsed_secs(job) {
+                        span.kv { span.k { "took" } (elapsed_label(secs)) }
+                    }
+                    @if let Some(s) = job.started_at {
+                        span.kv { span.k { "ran" } (fmt_oslo(s)) }
+                    }
+                    @if let Some(cost) = job.est_cost_nok {
+                        span.kv { span.k { "cost" } (fmt_kr(cost)) }
+                    }
                     @if let (Some(c), Some(b)) = (job.est_cost_nok, job.baseline_cost_nok) {
-                        @if b - c > 0.005 { span.good { "saved ~" (fmt_kr(b - c)) " vs submit" } }
+                        @if b - c > 0.005 {
+                            span.kv.good { "saved ~" (fmt_kr(b - c)) " vs submit" }
+                        }
                     }
                 }
                 @if let Some(out) = &job.output {
                     @if !out.trim().is_empty() {
-                        details { summary { "output" } pre { (out.as_str()) } }
+                        // hx-preserve keeps the fold open across the 5 s poll.
+                        details.out id=(format!("out-{}", job.id)) hx-preserve="true" {
+                            summary { "output" }
+                            pre { (out.as_str()) }
+                        }
                     }
                 }
             }
 
             div.actions {
                 @if job.status == JobStatus::Pending {
-                    button hx-post=(format!("/jobs/{}/run", job.id)) hx-target="#jobs" hx-swap="innerHTML" { "run now" }
+                    button.now hx-post=(format!("/jobs/{}/run", job.id)) hx-target="#jobs" hx-swap="innerHTML"
+                        hx-confirm="Run now at the current price, skipping the schedule?" { "run now" }
                     button hx-post=(format!("/jobs/{}/cancel", job.id)) hx-target="#jobs" hx-swap="innerHTML" { "cancel" }
                 }
                 button.danger hx-post=(format!("/jobs/{}/delete", job.id)) hx-target="#jobs" hx-swap="innerHTML"
@@ -328,7 +456,19 @@ fn render_job(
     }
 }
 
-pub(super) fn add_form() -> Markup {
+/// The collapsible "new job" panel. `open` expands it (used when there are no
+/// jobs yet); `oob` marks it as an out-of-band swap so a successful create
+/// replaces the form with a fresh, collapsed one.
+pub(super) fn add_job_panel(open: bool, oob: bool) -> Markup {
+    html! {
+        details.adder #add-job open[open] hx-swap-oob=[oob.then_some("true")] {
+            summary { h2 { "new job" } }
+            (add_form())
+        }
+    }
+}
+
+fn add_form() -> Markup {
     html! {
         form hx-post="/jobs" hx-target="#jobs" hx-swap="innerHTML" {
             label.wide { "Command"
@@ -347,19 +487,22 @@ pub(super) fn add_form() -> Markup {
                     }
                     small.hint { "When to start, given the price." }
                 }
+                label.threshold-field { "Threshold (kr/kWh)"
+                    input type="number" step="0.01" name="threshold_nok" placeholder="1.20";
+                    small.hint { "Against the effective price in the chart, not raw spot." }
+                }
                 label { "Est. duration (min)"
                     input #duration-input type="number" name="duration_minutes" value="60" min="1";
                     small.hint { "First guess; refined from real run times after a few runs." }
                 }
-                label { "Threshold (kr/kWh)"
-                    input type="number" step="0.01" name="threshold_nok" placeholder="1.20";
-                    small.hint { "Compared against the effective price in the chart, not raw spot." }
+                label { "Power (W)"
+                    input type="number" step="1" name="power_watts" placeholder="150";
+                    small.hint { "Lets the planner price the run and honor the site power budget." }
                 }
                 label { "Finish by (optional)"
                     input type="datetime-local" name="deadline";
-                    small.hint { "Job must be DONE by this time — it's started early enough to finish, not started at this time." }
+                    small.hint { "Oslo time. The job is started early enough to be DONE by then — not started at this time." }
                 }
-                label { "Power (W)" input type="number" step="1" name="power_watts" placeholder="150"; }
                 label { "Priority"
                     select name="priority" {
                         option value="normal" { "Normal" }
@@ -367,16 +510,16 @@ pub(super) fn add_form() -> Markup {
                         option value="high" { "High" }
                         option value="critical" { "Critical" }
                     }
-                    small.hint { "Who goes first when job slots are scarce. Unrelated to price." }
+                    small.hint { "Who gets a slot when slots are scarce. Unrelated to price." }
                 }
                 label { "Repeat"
                     select name="repeat" {
                         option value="none" { "Once" }
-                        option value="daily" { "Daily (rolls deadline +24h)" }
+                        option value="daily" { "Daily (rolls deadline +24 h)" }
                     }
                 }
             }
-            button type="submit" { "Add job" }
+            button type="submit" { "add job" }
         }
     }
 }

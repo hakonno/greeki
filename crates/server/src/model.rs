@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use spotwatt_core::{Policy, Priority};
 
 /// Lifecycle state of a job.
@@ -36,7 +36,7 @@ impl JobStatus {
 }
 
 /// How (and whether) a job re-creates itself after it finishes.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Repeat {
     /// Single-shot: runs once and is done.
@@ -44,6 +44,13 @@ pub enum Repeat {
     /// On completion, schedule the same job again for the next day (any deadline
     /// rolls forward 24h). Makes "nightly backup before 07:00" actually nightly.
     Daily,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for Repeat {
+    fn default() -> Self {
+        Repeat::None
+    }
 }
 
 impl Repeat {

@@ -158,7 +158,8 @@ instead of when it's expensive.
 | Path | What |
 |------|------|
 | `crates/core` | Pure, I/O-free scheduling logic + unit tests. `plan()` is the brain. |
-| `crates/server` | The daemon: price fetch, sqlite, scheduler loop, executor, dashboard. |
+| `crates/server` | The daemon: price fetch, sqlite, scheduler loop, executor, dashboard + JSON API. |
+| `crates/cli` | `spotwatt-cli`: a command-line client for a running server (add/list/cancel/run jobs, see prices). |
 
 Tech: Rust, [axum](https://github.com/tokio-rs/axum) + [maud](https://maud.lambda.xyz)
 + [htmx](https://htmx.org) (no JS build step), [sqlx](https://github.com/launchbadge/sqlx)
@@ -184,6 +185,36 @@ Configuration is `config.toml` (path overridable via `SPOTWATT_CONFIG`), with
 - **Critical re-index now**
   Policy: immediate
 
+## CLI
+
+`spotwatt-cli` is a small command-line client for a server that's already
+running (yours, on your own machine or LAN — it doesn't run anything or talk
+to anything of its own). It's the scriptable alternative to the dashboard
+form: point it at your server and submit a job in one line, from a cron job,
+a systemd unit, or just a shell.
+
+```sh
+cargo install --path crates/cli   # or: cargo build -p spotwatt-cli --release
+
+spotwatt-cli add --name "nightly backup" --deadline 07:00 --power 60 \
+  -- rsync -a /data backup:/
+
+spotwatt-cli list
+spotwatt-cli show 1
+spotwatt-cli cancel 1
+spotwatt-cli price
+```
+
+It defaults to `http://127.0.0.1:8080`; point it elsewhere with `--url` or
+`SPOTWATT_URL` for a server on another machine on your LAN. `--deadline`
+takes either `HH:MM` (next occurrence, Europe/Oslo — same as the dashboard)
+or a full RFC 3339 timestamp. Run `spotwatt-cli --help` for the full command
+list (`add`, `list`, `show`, `cancel`, `rm`, `run-now`, `price`) and
+`spotwatt-cli add --help` for every job field.
+
+The server's `/api/*` JSON endpoints the CLI talks to are also there for
+your own scripts — see [`crates/server/src/web/api.rs`](crates/server/src/web/api.rs).
+
 ## Tests
 
 ```sh
@@ -197,7 +228,9 @@ a site power budget for peak-shaving, per-job timeouts, and startup
 reconciliation of jobs orphaned by a crash. See [`docs/CRITIQUE.md`](docs/CRITIQUE.md)
 for an honest review of where this is and isn't worth it, and what's next.
 
-The command runs via `sh -c` and the dashboard has **no authentication** — run
-it only on a trusted network, and only with commands you trust. Adding auth (and
-an actuator layer for real high-draw devices like EV chargers and water heaters)
-is the next priority.
+The command runs via `sh -c` and neither the dashboard nor the JSON API (and so
+neither the CLI) has **any authentication** — run the server only on a trusted
+network, and only with commands you trust; anyone who can reach the port can
+submit and run arbitrary shell commands through either surface. Adding auth
+(and an actuator layer for real high-draw devices like EV chargers and water
+heaters) is the next priority.

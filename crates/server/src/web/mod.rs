@@ -1,6 +1,8 @@
 //! The HTTP surface: routing, request handlers, and form parsing. All HTML
-//! generation lives in [`render`]; the stylesheet in [`style`].
+//! generation lives in [`render`]; the stylesheet in [`style`]; the JSON API
+//! (for scripts and `spotwatt-cli`) in [`api`].
 
+pub mod api;
 mod render;
 mod style;
 
@@ -9,12 +11,12 @@ use std::sync::Arc;
 
 use axum::extract::{Form, Path, Query, State};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Router;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Europe::Oslo;
 use maud::{html, Markup};
 use serde::Deserialize;
-use spotwatt_core::{Estimate, Policy, PriceSeries, Priority};
+use spotwatt_core::{Estimate, Policy, Priority};
 
 use crate::model::{Job, NewJob, Repeat};
 use crate::{db, executor, AppState};
@@ -31,8 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/fragment/jobs", get(jobs_fragment))
         .route("/fragment/prices", get(prices_fragment))
         .route("/fragment/cmd-hint", get(cmd_hint))
-        .route("/api/prices", get(api_prices))
-        .route("/api/jobs", get(api_jobs))
+        .merge(api::router())
         .with_state(state)
 }
 
@@ -268,14 +269,6 @@ async fn run_now(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Mar
     jobs_fragment(State(state)).await
 }
 
-async fn api_prices(State(state): State<Arc<AppState>>) -> Json<PriceSeries> {
-    Json(state.prices.read().await.clone())
-}
-
-async fn api_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<Job>> {
-    Json(db::list_jobs(&state.db).await.unwrap_or_default())
-}
-
 #[derive(Debug, Deserialize)]
 pub struct CmdQuery {
     command: Option<String>,
@@ -355,7 +348,7 @@ fn parse_deadline(s: &str) -> Option<DateTime<Utc>> {
 mod preview {
     use super::*;
     use chrono::{Duration, TimeZone};
-    use spotwatt_core::PricePoint;
+    use spotwatt_core::{PricePoint, PriceSeries};
 
     use crate::config::Config;
     use crate::model::JobStatus;

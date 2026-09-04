@@ -1,9 +1,29 @@
 # spotwatt
 
-A power-price-aware compute scheduler for a homelab. It moves heavy,
-non-urgent work — backups, video transcoding, model training — to the cheapest
-hours of the day using Norwegian spot prices (Nord Pool via
+**A power-price-aware compute scheduler for Norwegian homelabs with variable
+electricity prices.** It moves heavy, non-urgent work — backups, video
+transcoding, model training — to the cheapest hours of the day using
+Norwegian spot prices (Nord Pool via
 [hvakosterstrommen.no](https://www.hvakosterstrommen.no)).
+
+> **🇳🇴 Built for Norway, not general-purpose.** The price source, the
+> bidding-zone config (`NO1`–`NO5`), and the whole tariff model — grid rent
+> day/night step, elavgift, strømstøtte, Norgespris — are specific to the
+> Norwegian market and Norwegian grid billing. It will *compile and run*
+> anywhere Rust runs, but the prices and savings it computes are only
+> meaningful for a Norwegian household or homelab. See [Pricing what you
+> actually pay](#pricing-what-you-actually-pay) for the model, and
+> [`crates/core/src/tariff.rs`](crates/core/src/tariff.rs) if you want to
+> adapt it to another market's price feed and grid-billing shape.
+
+**Who this is for:** a Norwegian homelab owner who already runs deferrable,
+somewhat power-hungry jobs — backups, transcodes, training runs — and wants
+them shifted off peak hours automatically. It's a niche tool, not a
+general-purpose must-have: on a typical low-draw homelab with nothing worth
+deferring, or outside a spot-price market like Norway's, it isn't useful.
+[`docs/CRITIQUE.md`](docs/CRITIQUE.md) is an honest, unflattering look at
+where the savings are real and where they're rounding error — read that
+before deciding it's for you.
 
 If you just want the architecture, jump to [How it fits together](#how-it-fits-together).
 Otherwise, here's the whole idea in plain terms first.

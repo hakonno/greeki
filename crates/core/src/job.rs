@@ -16,6 +16,15 @@ pub enum Policy {
     CheapestWindow,
 }
 
+// With no policy specified (e.g. a JSON API request that omits the field),
+// this is what spotwatt assumes you want.
+#[allow(clippy::derivable_impls)]
+impl Default for Policy {
+    fn default() -> Self {
+        Policy::CheapestWindow
+    }
+}
+
 /// Used to order jobs when the concurrency cap forces a choice. Declared
 /// lowest-to-highest so the derived `Ord` ranks `Critical` greatest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

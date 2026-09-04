@@ -53,15 +53,25 @@ decision continuously — so it never has to guess about the future.
 
 Think of it as four parts talking to each other:
 
-```
-hvakosterstrommen.no ──> price fetcher ──> in-memory price curve
-                                                │
-   jobs (sqlite) ──> scheduler tick (every 60s) ┘
-                          │  asks core::plan() per job, given current prices
-                          ▼
-                     launches due jobs ──> executor (sh -c) ──> records result + cost
-                          ▲
-   dashboard (axum + maud + htmx) ── add / cancel / run-now / inspect
+```mermaid
+flowchart LR
+    hvks["hvakosterstrommen.no"]
+    fetcher["price fetcher\n(every 30 min)"]
+    curve[("in-memory\nprice curve")]
+    db[("jobs\n(sqlite)")]
+    tick["scheduler tick\n(every 60s)"]
+    plan["core::plan()\nrun now, or wait?"]
+    exec["executor\n(sh -c)"]
+    dash["dashboard\n(axum + maud + htmx)"]
+
+    hvks --> fetcher --> curve
+    db --> tick
+    curve --> tick
+    tick --> plan --> tick
+    tick -- job is due --> exec
+    exec -- result + cost --> db
+    dash -- add / cancel / run-now / inspect --> db
+    db -- status --> dash
 ```
 
 1. **The fetcher** asks hvakosterstrommen.no every 30 minutes and keeps a fresh

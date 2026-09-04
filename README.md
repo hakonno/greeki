@@ -5,6 +5,15 @@ non-urgent work — backups, video transcoding, model training — to the cheape
 hours of the day using Norwegian spot prices (Nord Pool via
 [hvakosterstrommen.no](https://www.hvakosterstrommen.no)).
 
+> **🇳🇴 Norway-only, for now.** The price source, the bidding-zone config
+> (`NO1`–`NO5`), and the whole tariff model — grid rent day/night step,
+> elavgift, strømstøtte, Norgespris — are specific to the Norwegian market and
+> Norwegian grid billing. It will run anywhere Rust runs, but the numbers it
+> produces are only meaningful in Norway. See [Pricing what you actually
+> pay](#pricing-what-you-actually-pay) for the model, and
+> [`crates/core/src/tariff.rs`](crates/core/src/tariff.rs) if you want to
+> adapt it to another market's price feed and grid-billing shape.
+
 If you just want the architecture, jump to [How it fits together](#how-it-fits-together).
 Otherwise, here's the whole idea in plain terms first.
 
